@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-relay"
+version = "0.1.0"
+description = "A wrapper for the OpenAI Codex CLI with automatic HTTP proxy configuration and self-upgrade support"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.0",
+    "requests>=2.28",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+codex-relay = "codex_relay.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/user/codex-relay"
+
+[tool.setuptools.packages.find]
+where = ["src"]
