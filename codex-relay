@@ -446,10 +446,74 @@ async function cmdDns(args) {
   }
 }
 
-async function cmdInstall(opts = {}) {
+async function cmdInstallSelf(opts = {}) {
+  const binDir = "/usr/local/bin";
+  const dest = path.join(binDir, NAME);
+
+  let scriptContent;
+  if (opts.url) {
+    // Download from URL
+    info(`downloading from ${opts.url} ...`);
+    const resp = await fetch(opts.url);
+    if (!resp.ok) die(`download failed: ${resp.status}`);
+    scriptContent = await resp.text();
+  } else {
+    // Copy self
+    scriptContent = fs.readFileSync(process.argv[1], "utf8");
+  }
+
+  // Check if already installed — prompt unless --force
+  if (fs.existsSync(dest) && !opts.force) {
+    const readline = require("readline");
+    const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+    const answer = await new Promise((res) => {
+      rl.question(`  ${NAME} already exists at ${dest}. Overwrite? [y/N] `, (a) => {
+        rl.close();
+        res(a.trim().toLowerCase());
+      });
+    });
+    if (answer !== "y" && answer !== "yes") {
+      info("skipped.");
+      return;
+    }
+  }
+
+  // Write to bin directory
+  try {
+    fs.writeFileSync(dest, scriptContent, { mode: 0o755 });
+    info(`installed to ${dest}`);
+  } catch (e) {
+    if (e.code === "EACCES") {
+      throw new Error(`permission denied (${dest}). Try: sudo ${NAME} install`);
+    }
+    throw e;
+  }
+}
+
+async function cmdInstallCodex(env, version) {
   const npm = "npm";
   try { execSync("which npm", { encoding: "utf8" }); } catch { die("npm not found. Install Node.js: https://nodejs.org"); }
 
+  let pkg = "@openai/codex";
+  if (version) pkg += `@${version}`;
+  info(`installing ${pkg} ...`);
+  const proc = spawn(npm, ["install", "-g", pkg], { env, stdio: "inherit" });
+  await new Promise((res) => proc.on("close", res));
+  const ver = codexVersion();
+  info(`installed: ${ver || "latest"}`);
+}
+
+async function cmdUpdateCodex(env) {
+  const npm = "npm";
+  try { execSync("which npm", { encoding: "utf8" }); } catch { die("npm not found. Install Node.js: https://nodejs.org"); }
+  info("updating @openai/codex ...");
+  const proc = spawn(npm, ["update", "-g", "@openai/codex"], { env, stdio: "inherit" });
+  await new Promise((res) => proc.on("close", res));
+  const ver = codexVersion();
+  info(`updated: ${ver || "latest"}`);
+}
+
+async function cmdInstall(opts = {}) {
   // Apply proxy
   const cfg = loadConfig();
   const proxyUrl = cfg.https || cfg.http;
@@ -461,21 +525,33 @@ async function cmdInstall(opts = {}) {
     env.https_proxy = proxyUrl;
   }
 
+  // Explicit flags — do exactly what was asked
   if (opts.update) {
-    info("updating @openai/codex ...");
-    const proc = spawn(npm, ["update", "-g", "@openai/codex"], { env, stdio: "inherit" });
-    await new Promise((res) => proc.on("close", res));
-    const ver = codexVersion();
-    info(`updated: ${ver || "latest"}`);
-  } else {
-    let pkg = "@openai/codex";
-    if (opts.version) pkg += `@${opts.version}`;
-    info(`installing ${pkg} ...`);
-    const proc = spawn(npm, ["install", "-g", pkg], { env, stdio: "inherit" });
-    await new Promise((res) => proc.on("close", res));
-    const ver = codexVersion();
-    info(`installed: ${ver || "latest"}`);
+    await cmdUpdateCodex(env);
+    return;
   }
+  if (opts.version) {
+    await cmdInstallCodex(env, opts.version);
+    return;
+  }
+
+  // Default: install both codex-relay + codex CLI
+  info("step 1/2: installing codex-relay ...");
+  try {
+    await cmdInstallSelf(opts);
+  } catch (e) {
+    if (opts.force) die(e.message);
+    info(`codex-relay self-install skipped (${e.message})`);
+  }
+
+  info("step 2/2: checking Codex CLI ...");
+  if (findCodex()) {
+    info(`codex already installed (${codexVersion() || "unknown"})`);
+  } else {
+    await cmdInstallCodex(env);
+  }
+
+  info("install complete.");
 }
 
 function cmdRun(args) {
@@ -537,7 +613,9 @@ function printHelp() {
     ${NAME} dns resolve <host>                       - resolve hostname IP
     ${NAME} dns cache                                - cache all OpenAI domain IPs
     ${NAME} dns show                                 - show cached DNS entries
-    ${NAME} install [--update] [--version X]         - install/update codex CLI
+    ${NAME} install [--force]                        - install both codex-relay & codex CLI
+    ${NAME} install --update                         - update codex CLI
+    ${NAME} install --version X                      - install specific codex version
     ${NAME} run <args...>                            - run codex with proxy
     ${NAME} <anything>                               - passthrough to codex
     ${NAME} --version                                - show version info`);
@@ -559,6 +637,8 @@ function parseArgs(argv) {
       i++;
     } else if (argv[i] === "--update") {
       opts.update = true;
+    } else if (argv[i] === "--force") {
+      opts.force = true;
     } else {
       opts._.push(argv[i]);
     }
