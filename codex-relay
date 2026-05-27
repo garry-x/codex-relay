@@ -797,8 +797,8 @@ function cmdProxyCheck() {
   if (proxyUrl && haveCurl) {
     try {
       const out = execSync(
-        `curl -s -o /dev/null -w '%{http_code}' --proxy '${proxyUrl}' --connect-timeout 5 --max-time 8 'https://ipv4.icanhazip.com'`,
-        { encoding: "utf8", timeout: 10000 }
+        `curl -s -o /dev/null -w '%{http_code}' --proxy '${proxyUrl}' --connect-timeout 3 --max-time 6 'https://ipv4.icanhazip.com'`,
+        { encoding: "utf8", timeout: 8000 }
       ).trim();
       const code = parseInt(out, 10);
       check("upstream reachable", code >= 200 && code < 500, `HTTP ${out}`);
@@ -819,57 +819,50 @@ function cmdProxyCheck() {
     const bestIp = getBestIp("api.openai.com");
     const allIps = (aoiEntry?.ips || []).map((e) => `${e.ok === true ? "✓" : e.ok === false ? "✗" : "·"}${e.ip}`);
 
-    // 6a. Test CONNECT tunnel via local proxy (verifies DNS bypass)
+    // 6a + 6b. Single curl to api.openai.com: check CONNECT + HTTPS
     const ipInfo = bestIp ? ` (best: ${bestIp})` : "";
     let tunnelOk = false;
     try {
-      const connectResp = execSync(
-        `curl -v -x 'http://127.0.0.1:${port}' --connect-timeout 5 --max-time 6 'https://api.openai.com' -o /dev/null 2>&1 || true`,
-        { encoding: "utf8", timeout: 8000 }
+      const resp = execSync(
+        `curl -v -w '\\nHTTP_CODE:%{http_code}' -x 'http://127.0.0.1:${port}' ` +
+        `--connect-timeout 5 --max-time 8 'https://api.openai.com' -o /dev/null 2>&1 || true`,
+        { encoding: "utf8", timeout: 10000 }
       );
-      tunnelOk = connectResp.includes("CONNECT phase completed") ||
-                 connectResp.includes("tunnel established");
-    } catch {}
-    if (tunnelOk) {
-      check("api.openai.com CONNECT", true, `tunnel established via local proxy${ipInfo}`);
-    } else if (allIps.length > 0) {
-      check("api.openai.com CONNECT", false, `tunnel failed — IPs: ${allIps.join(", ")}`);
-    } else {
-      check("api.openai.com CONNECT", false, "tunnel failed — run: dns cache");
-    }
+      tunnelOk = resp.includes("CONNECT phase completed") || resp.includes("tunnel established");
+      const httpMatch = resp.match(/HTTP_CODE:(\d+)/);
+      const httpCode = httpMatch ? parseInt(httpMatch[1], 10) : 0;
 
-    // 6b. Full HTTPS (may fail even if CONNECT works)
-    if (tunnelOk) {
-      try {
-        const out = execSync(
-          `curl -s -o /dev/null -w '%{http_code}' --proxy 'http://127.0.0.1:${port}' --connect-timeout 5 --max-time 8 'https://api.openai.com' 2>/dev/null; true`,
-          { encoding: "utf8", timeout: 10000 }
-        ).trim();
-        const code = parseInt(out, 10) || 0;
-        if (code >= 200 && code < 500) {
-          check("api.openai.com HTTPS", true, `HTTP ${out}`);
+      if (tunnelOk) {
+        check("api.openai.com CONNECT", true, `tunnel established via local proxy${ipInfo}`);
+      } else {
+        check("api.openai.com CONNECT", false, allIps.length > 0 ? `tunnel failed — IPs: ${allIps.join(", ")}` : "tunnel failed — run: dns cache");
+      }
+
+      if (tunnelOk) {
+        if (httpCode >= 200 && httpCode < 500) {
+          check("api.openai.com HTTPS", true, `HTTP ${httpCode}`);
         } else {
-          check("api.openai.com HTTPS", false, `TLS handshake failed (HTTP ${code || "000"})`);
+          check("api.openai.com HTTPS", false, `TLS handshake failed (HTTP ${httpCode || "000"})`);
         }
-      } catch {
-        check("api.openai.com HTTPS", false, "TLS handshake failed — cause unknown (not a blanket IP block, other Cloudflare sites work)");
+      }
+    } catch {
+      if (!tunnelOk) {
+        check("api.openai.com", false, "connection failed — check proxy and DNS cache");
       }
     }
 
-    // 6c. WebSocket upgrade test (codex core uses WebSocket transport)
+    // 6c. WebSocket transport check
     if (tunnelOk && haveCurl) {
       try {
         const wsResp = execSync(
-          `curl -s -o /dev/null -w '%{http_code}' --proxy 'http://127.0.0.1:${port}' --connect-timeout 5 --max-time 8 ` +
+          `curl -s -o /dev/null -w '%{http_code}' --proxy 'http://127.0.0.1:${port}' --connect-timeout 3 --max-time 5 ` +
           `-H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' ` +
           `-H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' ` +
           `'https://httpbin.org/get' 2>/dev/null; true`,
-          { encoding: "utf8", timeout: 10000 }
+          { encoding: "utf8", timeout: 7000 }
         ).trim();
         const wsCode = parseInt(wsResp, 10) || 0;
-        if (wsCode === 101) {
-          check("WebSocket transport", true, "HTTP 101 — upgrade accepted");
-        } else if (wsCode >= 200 && wsCode < 500) {
+        if (wsCode >= 200 && wsCode < 500) {
           check("WebSocket transport", true, `proxy tunnel works for WS (HTTP ${wsCode})`);
         } else if (wsCode === 0) {
           check("WebSocket transport", false, "TLS issue — may cause codex WebSocket timeout/fallback");
