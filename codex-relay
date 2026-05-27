@@ -14,15 +14,24 @@ const { spawn, execSync } = require("child_process");
 
 const NAME = "codex-relay";
 const VERSION = "0.2.0";
-const CONFIG_DIR = path.join(os.homedir(), ".codex-relay");
+
+// When running via sudo, use the original user's home, not /var/root
+const SUDO_USER = process.env.SUDO_USER;
+const REAL_HOME = SUDO_USER ? path.join("/Users", SUDO_USER) : os.homedir();
+const CONFIG_DIR = path.join(REAL_HOME, ".codex-relay");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 const DNS_CACHE_FILE = path.join(CONFIG_DIR, "dns.json");
 const PID_FILE = path.join(CONFIG_DIR, "proxy.pid");
 const PORT_FILE = path.join(CONFIG_DIR, "proxy.port");
 const BYPASS_PID_FILE = path.join(CONFIG_DIR, "bypass.pid");
 
+// Resolve script path (handle relative paths for sudo)
+const SCRIPT_PATH = (() => {
+  try { return fs.realpathSync(process.argv[1]); } catch { return process.argv[1]; }
+})();
+
 const BYPASS_HOSTS = [
-  { host: "chatgpt.com", alias: "127.0.0.2" },
+  { host: "chatgpt.com", alias: "127.0.0.1" },
 ];
 
 const OPENAI_DOMAINS = [
@@ -294,7 +303,7 @@ function cmdProxyShow() {
 
   // Bypass status
   if (isBypassRunning()) {
-    console.log(`bypass:          active (127.0.0.2:443 → local proxy)`);
+    console.log(`bypass:          active (127.0.0.1:443 → local proxy)`);
   } else if (localPort) {
     console.log(`bypass:          stopped (run: sudo ${NAME} proxy bypass)`);
   }
@@ -317,29 +326,41 @@ function cmdProxyStart() {
   if (isProxyRunning()) {
     const port = fs.readFileSync(PORT_FILE, "utf8").trim();
     info(`local proxy already running on 127.0.0.1:${port}`);
-    return;
-  }
+  } else {
+    // Launch daemon process
+    const child = spawn(
+      process.execPath,
+      [SCRIPT_PATH, "--_daemon", upstreamUrl],
+      { detached: true, stdio: "ignore" }
+    );
+    child.unref();
 
-  // Launch daemon process
-  const child = spawn(
-    process.execPath,
-    [process.argv[1], "--_daemon", upstreamUrl],
-    { detached: true, stdio: "ignore" }
-  );
-  child.unref();
+    for (let i = 0; i < 20; i++) {
+      if (isProxyRunning()) break;
+      execSync("sleep 0.1", { stdio: "ignore" });
+    }
 
-  // Wait up to 2 seconds for PID file to appear
-  for (let i = 0; i < 20; i++) {
-    if (isProxyRunning()) break;
-    execSync("sleep 0.1", { stdio: "ignore" });
-  }
-
-  if (isProxyRunning()) {
+    if (!isProxyRunning()) die("failed to start local proxy daemon");
     const port = fs.readFileSync(PORT_FILE, "utf8").trim();
     info(`local proxy started on 127.0.0.1:${port}`);
     info(`HTTP_PROXY=http://127.0.0.1:${port} is active for codex sessions`);
+  }
+
+  // Bypass: hosts + forwarder on 127.0.0.1:443 (needs sudo)
+  const port = fs.readFileSync(PORT_FILE, "utf8").trim();
+  if (isBypassRunning()) {
+    info("bypass already running (127.0.0.1:443 → 127.0.0.1:" + port + ")");
   } else {
-    die("failed to start local proxy daemon");
+    info("setting up bypass — sudo required for /etc/hosts and port 443 ...");
+    try {
+      execSync(
+        `sudo "${process.execPath}" "${SCRIPT_PATH}" --_bypass-setup ${port}`,
+        { stdio: "inherit" }
+      );
+    } catch {
+      info("bypass setup skipped (sudo failed or declined).");
+      info("run later: sudo " + NAME + " proxy bypass");
+    }
   }
 }
 
@@ -388,14 +409,29 @@ function runProxyDaemon(upstreamUrl) {
 }
 
 function cmdProxyStop() {
-  if (!isProxyRunning()) {
-    info("local proxy not running.");
+  if (!isProxyRunning() && !isBypassRunning()) {
+    info("no proxy daemon running.");
     return;
   }
-  const pid = parseInt(fs.readFileSync(PID_FILE, "utf8").trim(), 10);
-  try { process.kill(pid, "SIGTERM"); } catch {}
-  cleanupProxyFiles();
-  info("local proxy stopped.");
+
+  if (isProxyRunning()) {
+    const pid = parseInt(fs.readFileSync(PID_FILE, "utf8").trim(), 10);
+    try { process.kill(pid, "SIGTERM"); } catch {}
+    cleanupProxyFiles();
+    info("local proxy stopped.");
+  }
+
+  if (isBypassRunning()) {
+    info("tearing down bypass — sudo may be required ...");
+    try {
+      execSync(
+        `sudo "${process.execPath}" "${SCRIPT_PATH}" --_bypass-teardown`,
+        { stdio: "inherit" }
+      );
+    } catch {
+      info("bypass teardown failed (run: sudo " + NAME + " proxy bypass --remove)");
+    }
+  }
 }
 
 function cleanupProxyFiles() {
@@ -406,8 +442,10 @@ function cleanupProxyFiles() {
 function isBypassRunning() {
   try {
     const pid = parseInt(fs.readFileSync(BYPASS_PID_FILE, "utf8").trim(), 10);
-    process.kill(pid, 0);
-    return true;
+    try { process.kill(pid, 0); return true; } catch {}
+    // Root-owned process — check via ps
+    const out = execSync(`ps -p ${pid} -o comm= 2>/dev/null`, { encoding: "utf8", timeout: 2000 }).trim();
+    return out.includes("codex-relay-bypass");
   } catch {
     return false;
   }
@@ -425,8 +463,11 @@ function runBypassDaemon(proxyPort) {
     clientSocket.on("error", () => { try { upstream.end(); } catch {} });
   });
 
-  server.on("error", () => process.exit(1));
-  server.listen(443, "127.0.0.2", () => {
+  server.on("error", (e) => {
+    fs.writeFileSync(path.join(CONFIG_DIR, "bypass.error"), e.message);
+    process.exit(1);
+  });
+  server.listen(443, "127.0.0.1", () => {
     fs.writeFileSync(BYPASS_PID_FILE, String(process.pid));
 
     try { process.stdin.destroy(); } catch {}
@@ -500,12 +541,12 @@ function cmdProxyBypass(opts = {}) {
 
   // 1. Add hosts entries
   manageHosts("add");
-  info("hosts: chatgpt.com → 127.0.0.2");
+  info("hosts: chatgpt.com → 127.0.0.1");
 
   // 2. Launch bypass daemon (needs sudo for port 443)
   const child = spawn(
     process.execPath,
-    [process.argv[1], "--_bypass-daemon", String(localPort)],
+    [SCRIPT_PATH, "--_bypass-daemon", String(localPort)],
     { detached: true, stdio: "ignore" }
   );
   child.unref();
@@ -516,7 +557,7 @@ function cmdProxyBypass(opts = {}) {
   }
 
   if (isBypassRunning()) {
-    info("bypass started: 127.0.0.2:443 → 127.0.0.1:" + localPort);
+    info("bypass started: 127.0.0.1:443 → 127.0.0.1:" + localPort);
   } else {
     die("bypass failed to start. Try: sudo codex-relay proxy bypass");
   }
@@ -558,6 +599,7 @@ function cmdProxyTest(opts = {}) {
   console.log(`Proxy:    ${proxyUrl}`);
   console.log(`Test URL: ${testUrl}`);
 
+  let allOk = true;
   const start = Date.now();
   try {
     const out = execSync(
@@ -572,15 +614,230 @@ function cmdProxyTest(opts = {}) {
       console.log(`Result:   OK — proxy is reachable`);
     } else {
       console.log(`Result:   FAIL — got status ${out}`);
-      process.exit(1);
+      allOk = false;
     }
   } catch {
     const latency = Date.now() - start;
     console.log(`Status:   000`);
     console.log(`Latency:  ${latency}ms`);
     console.log(`Result:   FAIL — could not connect`);
-    process.exit(1);
+    allOk = false;
   }
+
+  // Bypass verification
+  if (isBypassRunning()) {
+    console.log(`\nBypass check:`);
+    console.log(`  Mode:    active (127.0.0.1:443 → 127.0.0.1:${localPort})`);
+
+    // Verify hosts override
+    try {
+      const resolved = execSync(`dscacheutil -q host -a name chatgpt.com 2>/dev/null | grep "ip_address"`, { encoding: "utf8", timeout: 2000 }).trim();
+      const ips = resolved.split("\n").map((l) => l.replace("ip_address:", "").trim());
+      if (ips.some((ip) => ip === "127.0.0.1")) {
+        console.log(`  DNS:     chatgpt.com → 127.0.0.1 (hosts override OK)`);
+      } else {
+        console.log(`  DNS:     chatgpt.com → ${ips.join(", ")} (hosts override MISSING)`);
+        allOk = false;
+      }
+    } catch {
+      console.log(`  DNS:     could not verify hosts override`);
+      allOk = false;
+    }
+
+    // Test connectivity through bypass chain
+    try {
+      const out = execSync(
+        `curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 8 'https://chatgpt.com/backend-api/wham/apps'`,
+        { encoding: "utf8", timeout: 10000 }
+      ).trim();
+      const code = parseInt(out, 10);
+      if (code >= 200 && code < 500) {
+        console.log(`  Target:  chatgpt.com reachable (HTTP ${out})`);
+      } else {
+        console.log(`  Target:  chatgpt.com returned HTTP ${out}`);
+        allOk = false;
+      }
+    } catch {
+      console.log(`  Target:  chatgpt.com unreachable — check upstream proxy`);
+      allOk = false;
+    }
+  } else if (localPort) {
+    console.log(`\nBypass check: stopped — run: sudo ${NAME} proxy bypass`);
+  }
+
+  if (!allOk) process.exit(1);
+}
+
+function cmdProxyCheck() {
+  const issues = [];
+  const ok = [];
+
+  const check = (label, condition, detail) => {
+    if (condition) {
+      ok.push(label + (detail ? ` (${detail})` : ""));
+    } else {
+      issues.push(label + (detail ? ` — ${detail}` : ""));
+    }
+  };
+
+  // 1. Upstream proxy config
+  const cfg = loadConfig();
+  const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy ||
+                   process.env.HTTP_PROXY || process.env.http_proxy ||
+                   cfg.https || cfg.http;
+  check("upstream proxy config", !!proxyUrl, proxyUrl || "not configured");
+
+  // 2. Local proxy daemon
+  const localRunning = isProxyRunning();
+  if (localRunning) {
+    const port = fs.readFileSync(PORT_FILE, "utf8").trim();
+    check("local proxy daemon", true, `running on 127.0.0.1:${port}`);
+  } else {
+    check("local proxy daemon", false, "not running — start with: proxy start");
+  }
+
+  // 3. DNS cache
+  const cache = loadDnsCache();
+  const cacheEntries = Object.keys(cache).length;
+  check("DNS cache", cacheEntries > 0, `${cacheEntries} entries`);
+
+  // 4. curl available
+  const haveCurl = !!shutil("curl");
+  check("curl", haveCurl, haveCurl ? "available" : "not found — required for proxy test");
+
+  // 5. Upstream proxy connectivity (if configured)
+  if (proxyUrl && haveCurl) {
+    try {
+      const out = execSync(
+        `curl -s -o /dev/null -w '%{http_code}' --proxy '${proxyUrl}' --connect-timeout 5 --max-time 8 'https://ipv4.icanhazip.com'`,
+        { encoding: "utf8", timeout: 10000 }
+      ).trim();
+      const code = parseInt(out, 10);
+      check("upstream reachable", code >= 200 && code < 500, `HTTP ${out}`);
+    } catch {
+      check("upstream reachable", false, "connection failed — check proxy URL or network");
+    }
+  } else if (!haveCurl) {
+    check("upstream reachable", false, "curl not available");
+  } else {
+    check("upstream reachable", false, "no proxy configured");
+  }
+
+  // 6. api.openai.com reachable through local proxy (DNS + CONNECT)
+  if (localRunning) {
+    const port = fs.readFileSync(PORT_FILE, "utf8").trim();
+    const dnsCache = loadDnsCache();
+    const cachedIp = dnsCache["api.openai.com"]?.ip;
+
+    // 6a. Test CONNECT tunnel via local proxy (verifies DNS bypass)
+    const ipInfo = cachedIp ? ` (cached: ${cachedIp})` : "";
+    let tunnelOk = false;
+    try {
+      const connectResp = execSync(
+        `curl -v -x 'http://127.0.0.1:${port}' --connect-timeout 5 --max-time 6 'https://api.openai.com' -o /dev/null 2>&1 || true`,
+        { encoding: "utf8", timeout: 8000 }
+      );
+      tunnelOk = connectResp.includes("CONNECT phase completed") ||
+                 connectResp.includes("tunnel established");
+    } catch {}
+    if (tunnelOk) {
+      check("api.openai.com CONNECT", true, `tunnel established via local proxy${ipInfo}`);
+    } else if (cachedIp) {
+      check("api.openai.com CONNECT", false, `tunnel failed (cached: ${cachedIp})`);
+    } else {
+      check("api.openai.com CONNECT", false, "tunnel failed — run: dns cache");
+    }
+    if (!tunnelOk) {
+      check("api.openai.com CONNECT", false, cachedIp ? `tunnel failed (cached: ${cachedIp})` : "tunnel failed — run: dns cache");
+    }
+
+    // 6b. Full HTTPS (may fail due to Cloudflare TLS blocking)
+    if (tunnelOk) {
+      try {
+        const out = execSync(
+          `curl -s -o /dev/null -w '%{http_code}' --proxy 'http://127.0.0.1:${port}' --connect-timeout 5 --max-time 8 'https://api.openai.com' 2>/dev/null; true`,
+          { encoding: "utf8", timeout: 10000 }
+        ).trim();
+        const code = parseInt(out, 10) || 0;
+        if (code >= 200 && code < 500) {
+          check("api.openai.com HTTPS", true, `HTTP ${out}`);
+        } else {
+          check("api.openai.com HTTPS", false, `TLS blocked (HTTP ${code || "000"}) — Cloudflare WAF on this proxy IP`);
+        }
+      } catch {
+        check("api.openai.com HTTPS", false, "TLS blocked — Cloudflare WAF rejects connections from this proxy IP");
+      }
+    }
+  } else {
+    check("api.openai.com", false, "local proxy not running");
+  }
+
+  // 7. Bypass status
+  const bypassRunning = isBypassRunning();
+  check("bypass (MCP fix)", bypassRunning, bypassRunning ? "active" : "not running — sudo proxy bypass");
+
+  // 8. Port 443 availability for bypass
+  if (!bypassRunning) {
+    const testServer = require("net").createServer();
+    let port443Free = false;
+    try {
+      testServer.listen(443, "127.0.0.1");
+      port443Free = true;
+      testServer.close();
+    } catch {
+      port443Free = false;
+    }
+    check("bypass port 127.0.0.1:443", port443Free, port443Free ? "available" : "in use — bypass may fail");
+  }
+
+  // 9. hosts file conflicts
+  try {
+    const hosts = fs.readFileSync("/etc/hosts", "utf8");
+    const ourMarker = "# codex-relay-bypass";
+    const ourEntries = hosts.split("\n").filter((l) => l.includes(ourMarker));
+    const otherChatgpt = hosts.split("\n").filter((l) =>
+      l.includes("chatgpt.com") && !l.includes(ourMarker) && l.trim() && !l.trim().startsWith("#")
+    );
+    if (otherChatgpt.length > 0 && !bypassRunning) {
+      check("hosts file", false, `chatgpt.com has conflicting entries: ${otherChatgpt.join("; ")}`);
+    } else if (bypassRunning && ourEntries.length > 0) {
+      check("hosts file", true, "bypass entries present");
+    } else {
+      check("hosts file", true, "no conflicts");
+    }
+  } catch {
+    check("hosts file", false, "cannot read /etc/hosts");
+  }
+
+  // 10. npm available
+  const haveNpm = !!shutil("npm");
+  check("npm", haveNpm, haveNpm ? "available" : "not found — needed for codex install");
+
+  // 11. codex binary
+  const codexBin = findCodex();
+  check("codex CLI", !!codexBin, codexBin ? codexVersion() : "not installed — run: install");
+
+  // 12. NO_PROXY
+  const noProxy = process.env.NO_PROXY || process.env.no_proxy || "";
+  check("NO_PROXY env", true, noProxy ? `set (${noProxy})` : "auto-set by `run` — local connections excluded from proxy");
+
+  // ── Results ──
+  console.log("codex-relay proxy check\n");
+  for (const item of ok) {
+    console.log(`  ✓ ${item}`);
+  }
+  if (issues.length > 0) {
+    console.log("");
+    for (const item of issues) {
+      console.log(`  ✗ ${item}`);
+    }
+  }
+  console.log("");
+  console.log(`${ok.length} OK, ${issues.length} issue${issues.length !== 1 ? "s" : ""}`);
+}
+
+function shutil(name) {
+  try { execSync(`which ${name}`, { encoding: "utf8", stdio: "ignore" }); return true; } catch { return false; }
 }
 
 async function cmdDns(args) {
@@ -667,7 +924,7 @@ async function cmdInstallSelf(opts = {}) {
     scriptContent = await resp.text();
   } else {
     // Copy self
-    scriptContent = fs.readFileSync(process.argv[1], "utf8");
+    scriptContent = fs.readFileSync(SCRIPT_PATH, "utf8");
   }
 
   // Check if already installed — prompt unless --force
@@ -846,10 +1103,11 @@ function printHelp() {
     ${NAME} proxy show                               - show current config
     ${NAME} proxy unset                              - clear proxy config
     ${NAME} proxy test [--url URL] [--timeout S]     - test connectivity
+    ${NAME} proxy check                              - check for potential issues
     ${NAME} proxy start                              - start local DNS-resolving proxy
     ${NAME} proxy stop                               - stop local proxy
-    ${NAME} proxy bypass                             - enable /etc/hosts bypass (needs sudo)
-    ${NAME} proxy bypass --remove                    - disable bypass (needs sudo)
+    ${NAME} proxy bypass                             - toggle bypass standalone
+    ${NAME} proxy bypass --remove                    - disable bypass standalone
     ${NAME} dns resolve <host>                       - resolve hostname IP
     ${NAME} dns cache                                - cache all OpenAI domain IPs
     ${NAME} dns show                                 - show cached DNS entries
@@ -904,6 +1162,42 @@ async function main() {
     runBypassDaemon(proxyPort);
     return;
   }
+  if (raw[0] === "--_bypass-setup") {
+    // Called via sudo: adds hosts + launches bypass daemon
+    const proxyPort = parseInt(raw[1], 10);
+    if (!proxyPort) die("--_bypass-setup requires proxy port");
+    if (isBypassRunning()) {
+      console.log("[codex-relay] bypass already running.");
+      return;
+    }
+    manageHosts("add");
+    // Use shell backgrounding to reliably detach
+    execSync(
+      `nohup "${process.execPath}" "${SCRIPT_PATH}" --_bypass-daemon ${proxyPort} > /dev/null 2>&1 &`,
+      { stdio: "ignore" }
+    );
+    for (let i = 0; i < 20; i++) {
+      if (isBypassRunning()) break;
+      execSync("sleep 0.1", { stdio: "ignore" });
+    }
+    if (isBypassRunning()) {
+      console.log("[codex-relay] bypass started: 127.0.0.1:443 → 127.0.0.1:" + proxyPort);
+    } else {
+      console.error("error: bypass daemon failed to start");
+      process.exit(1);
+    }
+    return;
+  }
+  if (raw[0] === "--_bypass-teardown") {
+    // Called via sudo: stops bypass daemon + removes hosts
+    if (isBypassRunning()) {
+      const pid = parseInt(fs.readFileSync(BYPASS_PID_FILE, "utf8").trim(), 10);
+      try { process.kill(pid, "SIGTERM"); } catch {}
+      cleanupBypassFiles();
+    }
+    manageHosts("remove");
+    return;
+  }
 
   const cmd = raw[0];
   const args = raw.slice(1);
@@ -931,7 +1225,8 @@ async function main() {
         case "stop": cmdProxyStop(); break;
         case "test": cmdProxyTest(pargs); break;
         case "bypass": cmdProxyBypass(pargs); break;
-        default: die(`usage: ${NAME} proxy {set|show|unset|test|start|stop|bypass}`);
+        case "check": cmdProxyCheck(); break;
+        default: die(`usage: ${NAME} proxy {set|show|unset|test|start|stop|bypass|check}`);
       }
       break;
     }
