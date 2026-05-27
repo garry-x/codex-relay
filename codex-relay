@@ -71,43 +71,114 @@ function codexVersion() {
 
 // ── DNS resolution ─────────────────────────────────────────────────────────
 
-async function resolveHost(host) {
-  try {
-    const addrs = await dns.resolve4(host);
-    return addrs[0] || null;
-  } catch {
-    return null;
-  }
+async function resolveAllIPs(host) {
+  try { return await dns.resolve4(host); } catch { return []; }
 }
 
 function loadDnsCache() {
-  try { return JSON.parse(fs.readFileSync(DNS_CACHE_FILE, "utf8")); } catch { return {}; }
+  try {
+    const raw = JSON.parse(fs.readFileSync(DNS_CACHE_FILE, "utf8"));
+    // Migrate old single-IP format
+    for (const [host, entry] of Object.entries(raw)) {
+      if (entry.ip && !entry.ips) {
+        raw[host] = { ips: [{ ip: entry.ip, ok: null, testedAt: null }], ts: entry.ts || 0 };
+      }
+    }
+    return raw;
+  } catch { return {}; }
 }
 function saveDnsCache(cache) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
   fs.writeFileSync(DNS_CACHE_FILE, JSON.stringify(cache, null, 2));
 }
 
-async function refreshDnsCache(domains = OPENAI_DOMAINS) {
+function getBestIp(host) {
+  const cache = loadDnsCache();
+  const entry = cache[host];
+  if (!entry || !entry.ips?.length) return null;
+  // Priority: ok:true > ok:null (untested) > skip ok:false
+  const good = entry.ips.filter((e) => e.ok === true);
+  const untested = entry.ips.filter((e) => e.ok === null || e.ok === undefined);
+  const pool = good.length > 0 ? good : untested.length > 0 ? untested : entry.ips;
+  // Random within same priority tier
+  return pool[Math.floor(Math.random() * pool.length)]?.ip || null;
+}
+
+function markIpResult(host, ip, ok) {
+  const cache = loadDnsCache();
+  const entry = cache[host];
+  if (!entry || !entry.ips) return;
+  for (const e of entry.ips) {
+    if (e.ip === ip) { e.ok = ok; e.testedAt = Date.now(); break; }
+  }
+  // If none matched, add it
+  if (!entry.ips.some((e) => e.ip === ip)) {
+    entry.ips.push({ ip, ok, testedAt: Date.now() });
+  }
+  saveDnsCache(cache);
+}
+
+function upsertCacheIPs(host, ips) {
+  const cache = loadDnsCache();
+  const entry = cache[host] || { ips: [], ts: 0 };
+  const existing = new Map(entry.ips.map((e) => [e.ip, e]));
+  entry.ips = ips.map((ip) => {
+    const old = existing.get(ip);
+    return old || { ip, ok: null, testedAt: null };
+  });
+  entry.ts = Date.now();
+  cache[host] = entry;
+  saveDnsCache(cache);
+}
+
+// Test one IP through the upstream proxy by checking CONNECT response
+async function testIp(ip, host, port, upstreamUrl) {
+  const { host: upHost, port: upPort, auth } = parseProxyUrl(upstreamUrl);
+  return new Promise((resolve) => {
+    const sock = new net.Socket();
+    sock.setTimeout(3000);
+    sock.on("error", () => resolve(false));
+    sock.on("timeout", () => { sock.destroy(); resolve(false); });
+    sock.connect(upPort, upHost, () => {
+      let req = `CONNECT ${ip}:${port || 443} HTTP/1.1\r\nHost: ${host}:${port || 443}\r\n`;
+      if (auth) req += `Proxy-Authorization: Basic ${auth}\r\n`;
+      req += "\r\n";
+      sock.write(req);
+      sock.once("data", (data) => {
+        const ok = data.toString().startsWith("HTTP/1.1 200") || data.toString().startsWith("HTTP/1.0 200");
+        sock.destroy();
+        resolve(ok);
+      });
+    });
+  });
+}
+
+async function refreshDnsCache(domains = OPENAI_DOMAINS, proxyUrl) {
+  if (!proxyUrl) {
+    const cfg = loadConfig();
+    proxyUrl = cfg.https || cfg.http;
+  }
   const cache = loadDnsCache();
   for (const host of domains) {
-    const ip = await resolveHost(host);
-    if (ip) {
-      cache[host] = { ip, ts: Date.now() };
-      console.log(`  ${host.padEnd(30)} → ${ip}`);
+    const ips = await resolveAllIPs(host);
+    if (ips.length > 0) {
+      upsertCacheIPs(host, ips);
+      if (proxyUrl) {
+        const results = [];
+        for (const ip of ips) {
+          const ok = await testIp(ip, host, 443, proxyUrl);
+          results.push(ok ? "✓" : "✗");
+          markIpResult(host, ip, ok);
+        }
+        console.log(`  ${host.padEnd(30)} → ${ips.join(", ")}  [${results.join(" ")}]`);
+      } else {
+        console.log(`  ${host.padEnd(30)} → ${ips.join(", ")}  (no proxy to test)`);
+      }
     } else {
       console.log(`  ${host.padEnd(30)} → FAILED`);
     }
   }
-  saveDnsCache(cache);
-  return cache;
-}
-
-function getCachedIp(host) {
-  const cache = loadDnsCache();
-  const entry = cache[host];
-  if (entry) return entry.ip;
-  return null;
+  return loadDnsCache();
 }
 
 // Parse proxy URL: http://[user:pass@]host:port
@@ -152,54 +223,72 @@ function startLocalProxy(upstreamUrl, port = 0) {
         const host = connectMatch[1];
         const port = parseInt(connectMatch[2], 10);
 
-        // Try local DNS cache first, else resolve fresh
-        let ip = getCachedIp(host);
-        if (!ip) {
-          ip = await resolveHost(host);
-          if (ip) {
-            const cache = loadDnsCache();
-            cache[host] = { ip, ts: Date.now() };
-            saveDnsCache(cache);
-          }
+        // Resolve all IPs and cache if not already cached
+        let entry = loadDnsCache()[host];
+        if (!entry || !entry.ips?.length) {
+          const ips = await resolveAllIPs(host);
+          if (ips.length > 0) { upsertCacheIPs(host, ips); entry = loadDnsCache()[host]; }
         }
 
         // Parse proxy URL: http://[user:pass@]host:port
         const { host: upHost, port: upPort, auth } = parseProxyUrl(upstreamUrl);
 
-        const upstreamSocket = net.connect(upPort, upHost, () => {
-          // Rewrite CONNECT header: use IP instead of hostname
+        // Try up to 3 IPs
+        const triedIps = [];
+        let connected = false;
+        const MAX_TRIES = 3;
+
+        for (let attempt = 0; attempt < MAX_TRIES && !connected; attempt++) {
+          const ip = getBestIp(host);
+          if (!ip) break;
+          if (triedIps.includes(ip)) break;
+          triedIps.push(ip);
+
           const target = ip || host;
           let modified = headStr.replace(
             /^CONNECT .+:\d+/m,
             `CONNECT ${target}:${port}`
           );
-          // Inject Proxy-Authorization for the upstream proxy if absent
           if (auth && !/Proxy-Authorization:/im.test(modified)) {
             modified = modified.replace(
               /\r\n\r\n$/,
               `\r\nProxy-Authorization: Basic ${auth}\r\n\r\n`
             );
           }
-          upstreamSocket.write(modified);
-          // Wait for 200 response from upstream, then relay
-          upstreamSocket.once("data", (resp) => {
-            const respStr = resp.toString();
-            if (respStr.startsWith("HTTP/1.1 200") || respStr.startsWith("HTTP/1.0 200")) {
-              clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-            } else {
-              clientSocket.write(resp);
-            }
-            clientSocket.pipe(upstreamSocket);
-            upstreamSocket.pipe(clientSocket);
-          });
-        });
 
-        upstreamSocket.on("error", () => {
+          await new Promise((resolve) => {
+            const upstreamSocket = net.connect(upPort, upHost, () => {
+              upstreamSocket.write(modified);
+              upstreamSocket.once("data", (resp) => {
+                const respStr = resp.toString();
+                if (respStr.startsWith("HTTP/1.1 200") || respStr.startsWith("HTTP/1.0 200")) {
+                  markIpResult(host, ip, true);
+                  clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+                  clientSocket.pipe(upstreamSocket);
+                  upstreamSocket.pipe(clientSocket);
+                  connected = true;
+                } else {
+                  markIpResult(host, ip, false);
+                  upstreamSocket.destroy();
+                }
+                resolve();
+              });
+            });
+            upstreamSocket.on("error", () => {
+              markIpResult(host, ip, false);
+              try { upstreamSocket.destroy(); } catch {}
+              resolve();
+            });
+            clientSocket.on("error", () => {
+              try { upstreamSocket.destroy(); } catch {}
+              resolve();
+            });
+          });
+        }
+
+        if (!connected) {
           try { clientSocket.end(); } catch {}
-        });
-        clientSocket.on("error", () => {
-          try { upstreamSocket.end(); } catch {}
-        });
+        }
       });
     });
   });
@@ -214,14 +303,10 @@ async function forwardHttp(clientSocket, head, upstreamUrl) {
 
   if (reqMatch) {
     const host = reqMatch[2];
-    let ip = getCachedIp(host);
+    let ip = getBestIp(host);
     if (!ip) {
-      ip = await resolveHost(host);
-      if (ip) {
-        const cache = loadDnsCache();
-        cache[host] = { ip, ts: Date.now() };
-        saveDnsCache(cache);
-      }
+      const ips = await resolveAllIPs(host);
+      if (ips.length > 0) { upsertCacheIPs(host, ips); ip = getBestIp(host); }
     }
     if (ip) {
       // Rewrite request URL to use IP so upstream proxy doesn't need DNS
@@ -373,12 +458,8 @@ function runProxyDaemon(upstreamUrl) {
     while (true) {
       await new Promise((r) => setTimeout(r, REFRESH_INTERVAL));
       try {
-        const cache = loadDnsCache();
-        for (const host of OPENAI_DOMAINS) {
-          const ip = await resolveHost(host);
-          if (ip) cache[host] = { ip, ts: Date.now() };
-        }
-        saveDnsCache(cache);
+        // Refresh: resolve all IPs and test connectivity
+        await refreshDnsCache(OPENAI_DOMAINS, upstreamUrl);
       } catch {} // silent — proxy still works with stale cache
     }
   }
@@ -727,10 +808,12 @@ function cmdProxyCheck() {
   if (localRunning) {
     const port = fs.readFileSync(PORT_FILE, "utf8").trim();
     const dnsCache = loadDnsCache();
-    const cachedIp = dnsCache["api.openai.com"]?.ip;
+    const aoiEntry = dnsCache["api.openai.com"];
+    const bestIp = getBestIp("api.openai.com");
+    const allIps = (aoiEntry?.ips || []).map((e) => `${e.ok === true ? "✓" : e.ok === false ? "✗" : "·"}${e.ip}`);
 
     // 6a. Test CONNECT tunnel via local proxy (verifies DNS bypass)
-    const ipInfo = cachedIp ? ` (cached: ${cachedIp})` : "";
+    const ipInfo = bestIp ? ` (best: ${bestIp})` : "";
     let tunnelOk = false;
     try {
       const connectResp = execSync(
@@ -742,13 +825,10 @@ function cmdProxyCheck() {
     } catch {}
     if (tunnelOk) {
       check("api.openai.com CONNECT", true, `tunnel established via local proxy${ipInfo}`);
-    } else if (cachedIp) {
-      check("api.openai.com CONNECT", false, `tunnel failed (cached: ${cachedIp})`);
+    } else if (allIps.length > 0) {
+      check("api.openai.com CONNECT", false, `tunnel failed — IPs: ${allIps.join(", ")}`);
     } else {
       check("api.openai.com CONNECT", false, "tunnel failed — run: dns cache");
-    }
-    if (!tunnelOk) {
-      check("api.openai.com CONNECT", false, cachedIp ? `tunnel failed (cached: ${cachedIp})` : "tunnel failed — run: dns cache");
     }
 
     // 6b. Full HTTPS (may fail even if CONNECT works)
@@ -847,9 +927,9 @@ async function cmdDns(args) {
     case "lookup": {
       const host = args[1];
       if (!host) die(`usage: ${NAME} dns resolve <host>`);
-      const ip = await resolveHost(host);
-      if (ip) {
-        console.log(`${host} → ${ip}`);
+      const ips = await resolveAllIPs(host);
+      if (ips.length > 0) {
+        console.log(`${host} → ${ips.join(", ")}`);
       } else {
         console.log(`${host} → FAILED`);
         process.exit(1);
@@ -857,7 +937,7 @@ async function cmdDns(args) {
       break;
     }
     case "cache": {
-      info("caching DNS for OpenAI domains...");
+      info("caching & testing DNS for OpenAI domains...");
       await refreshDnsCache();
       break;
     }
@@ -868,11 +948,14 @@ async function cmdDns(args) {
         console.log("DNS cache is empty. Run: codex-relay dns cache");
       } else {
         const age = (ts) => {
+          if (!ts) return "never";
           const sec = Math.round((Date.now() - ts) / 1000);
           return sec < 60 ? `${sec}s ago` : `${Math.round(sec / 60)}m ago`;
         };
-        for (const [host, { ip, ts }] of entries) {
-          console.log(`${host.padEnd(30)} → ${ip.padEnd(18)} (${age(ts)})`);
+        const status = (e) => (e.ok === true ? "✓" : e.ok === false ? "✗" : "·");
+        for (const [host, entry] of entries) {
+          const ips = (entry.ips || []).map((e) => `${status(e)} ${e.ip}`).join(", ");
+          console.log(`${host.padEnd(30)} ${ips || "(no IPs)"}  (${age(entry.ts)})`);
         }
       }
       break;
