@@ -35,6 +35,21 @@ const DNS_CACHE_FILE = path.join(CONFIG_DIR, "dns.json");
 const PID_FILE = path.join(CONFIG_DIR, "proxy.pid");
 const PORT_FILE = path.join(CONFIG_DIR, "proxy.port");
 const BYPASS_PID_FILE = path.join(CONFIG_DIR, "bypass.pid");
+const LOG_FILE = path.join(CONFIG_DIR, "proxy.log");
+const MAX_LOG_LINES = 500;
+
+function proxyLog(msg) {
+  const ts = new Date().toISOString();
+  const line = `${ts} ${msg}\n`;
+  try {
+    fs.appendFileSync(LOG_FILE, line);
+    // Rotate if too large
+    const lines = fs.readFileSync(LOG_FILE, "utf8").split("\n");
+    if (lines.length > MAX_LOG_LINES + 50) {
+      fs.writeFileSync(LOG_FILE, lines.slice(-MAX_LOG_LINES).join("\n"));
+    }
+  } catch {}
+}
 
 // Resolve script path (handle relative paths for sudo)
 const SCRIPT_PATH = (() => {
@@ -296,6 +311,7 @@ async function handleRequest(clientSocket, head, upstreamUrl) {
             // TCP connect timeout: 3s to reach upstream proxy
             const connTimer = setTimeout(() => {
               markIpResult(host, ip, false);
+              proxyLog(`CONNECT ${host}:${port} → ${ip} connect timeout`);
               try { upstreamSocket.destroy(); } catch {}
               resolve(); // try next IP
             }, 3000);
@@ -305,6 +321,7 @@ async function handleRequest(clientSocket, head, upstreamUrl) {
               upstreamSocket.setTimeout(3000);
               upstreamSocket.on("timeout", () => {
                 markIpResult(host, ip, false);
+                proxyLog(`CONNECT ${host}:${port} → ${ip} response timeout`);
                 try { clientSocket.write("HTTP/1.1 504 Gateway Timeout\r\n\r\n"); clientSocket.end(); } catch {}
                 try { upstreamSocket.destroy(); } catch {}
                 connected = true;
@@ -322,7 +339,7 @@ async function handleRequest(clientSocket, head, upstreamUrl) {
                 const respStr = respBuf.toString("utf8", 0, headerEnd + 4);
                 if (respStr.startsWith("HTTP/1.1 200") || respStr.startsWith("HTTP/1.0 200")) {
                   markIpResult(host, ip, true);
-                  // Clear timeout — tunnel is established, let it run indefinitely
+                  proxyLog(`CONNECT ${host}:${port} → ${ip} OK`);
                   upstreamSocket.setTimeout(0);
                   upstreamSocket.removeAllListeners("timeout");
                   clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
@@ -333,6 +350,7 @@ async function handleRequest(clientSocket, head, upstreamUrl) {
                   connected = true;
                 } else {
                   markIpResult(host, ip, false);
+                  proxyLog(`CONNECT ${host}:${port} → ${ip} rejected: ${respStr.split("\r\n")[0]}`);
                   try { clientSocket.write(respStr); } catch {}
                   upstreamSocket.destroy();
                 }
@@ -357,6 +375,7 @@ async function handleRequest(clientSocket, head, upstreamUrl) {
         }
 
         if (!connected) {
+          proxyLog(`CONNECT ${host}:${port} FAIL all IPs tried: ${triedIps.join(", ")}`);
           try { clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"); clientSocket.end(); } catch {}
         }
   } catch {} // prevent handler crash from killing daemon
@@ -869,6 +888,16 @@ function cmdProxyTest(opts = {}) {
   if (!allOk) process.exit(1);
 }
 
+function cmdProxyLogs() {
+  try {
+    const content = fs.readFileSync(LOG_FILE, "utf8");
+    if (!content.trim()) { console.log("(no logs)"); return; }
+    process.stdout.write(content);
+  } catch {
+    console.log("(no logs)");
+  }
+}
+
 function cmdProxyCheck() {
   const issues = [];
   const ok = [];
@@ -1331,6 +1360,7 @@ function printHelp() {
     ${NAME} proxy check                              - check for potential issues
     ${NAME} proxy start                              - start local DNS-resolving proxy
     ${NAME} proxy stop                               - stop local proxy
+    ${NAME} proxy logs                               - view proxy daemon logs
     ${NAME} proxy bypass                             - toggle bypass standalone
     ${NAME} proxy bypass --remove                    - disable bypass standalone
     ${NAME} dns resolve <host>                       - resolve hostname IP
@@ -1451,8 +1481,9 @@ async function main() {
         case "test": cmdProxyTest(pargs); break;
         case "bypass": cmdProxyBypass(pargs); break;
         case "restart": cmdProxyStop(); cmdProxyStart(); break;
+        case "logs": cmdProxyLogs(); break;
         case "check": cmdProxyCheck(); break;
-        default: die(`usage: ${NAME} proxy {set|show|unset|test|start|stop|restart|bypass|check}`);
+        default: die(`usage: ${NAME} proxy {set|show|unset|test|start|stop|restart|bypass|check|logs}`);
       }
       break;
     }
