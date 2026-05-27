@@ -236,7 +236,7 @@ function startLocalProxy(upstreamUrl, port = 0) {
         // Try up to 3 IPs
         const triedIps = [];
         let connected = false;
-        const MAX_TRIES = 3;
+        const MAX_TRIES = 2; // 2 attempts; WebSocket has tight timeouts
 
         for (let attempt = 0; attempt < MAX_TRIES && !connected; attempt++) {
           const ip = getBestIp(host);
@@ -257,7 +257,14 @@ function startLocalProxy(upstreamUrl, port = 0) {
           }
 
           await new Promise((resolve) => {
-            const upstreamSocket = net.connect(upPort, upHost, () => {
+            const upstreamSocket = new net.Socket();
+            upstreamSocket.setTimeout(4000);
+            upstreamSocket.on("timeout", () => {
+              markIpResult(host, ip, false);
+              try { upstreamSocket.destroy(); } catch {}
+              resolve();
+            });
+            upstreamSocket.connect(upPort, upHost, () => {
               upstreamSocket.write(modified);
               upstreamSocket.once("data", (resp) => {
                 const respStr = resp.toString();
@@ -846,6 +853,31 @@ function cmdProxyCheck() {
         }
       } catch {
         check("api.openai.com HTTPS", false, "TLS handshake failed — cause unknown (not a blanket IP block, other Cloudflare sites work)");
+      }
+    }
+
+    // 6c. WebSocket upgrade test (codex core uses WebSocket transport)
+    if (tunnelOk && haveCurl) {
+      try {
+        const wsResp = execSync(
+          `curl -s -o /dev/null -w '%{http_code}' --proxy 'http://127.0.0.1:${port}' --connect-timeout 5 --max-time 8 ` +
+          `-H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' ` +
+          `-H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' ` +
+          `'https://httpbin.org/get' 2>/dev/null; true`,
+          { encoding: "utf8", timeout: 10000 }
+        ).trim();
+        const wsCode = parseInt(wsResp, 10) || 0;
+        if (wsCode === 101) {
+          check("WebSocket transport", true, "HTTP 101 — upgrade accepted");
+        } else if (wsCode >= 200 && wsCode < 500) {
+          check("WebSocket transport", true, `proxy tunnel works for WS (HTTP ${wsCode})`);
+        } else if (wsCode === 0) {
+          check("WebSocket transport", false, "TLS issue — may cause codex WebSocket timeout/fallback");
+        } else {
+          check("WebSocket transport", false, `HTTP ${wsCode}`);
+        }
+      } catch {
+        check("WebSocket transport", false, "timeout — check proxy latency");
       }
     }
   } else {
