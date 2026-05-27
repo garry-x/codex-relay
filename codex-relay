@@ -664,6 +664,22 @@ function isBypassRunning() {
 
 function runBypassDaemon(proxyPort) {
   process.title = "codex-relay-bypass";
+  proxyLog("bypass daemon started, pid=" + process.pid + ", target=127.0.0.1:" + proxyPort);
+
+  process.on("SIGHUP", () => {});
+  process.on("beforeExit", (code) => {
+    proxyLog(`bypass daemon exiting, code=${code}`);
+    try { fs.unlinkSync(BYPASS_PID_FILE); } catch {}
+  });
+
+  process.on("unhandledRejection", (e) => {
+    proxyLog(`bypass unhandled rejection: ${e?.message || e}`);
+  });
+  process.on("uncaughtException", (e) => {
+    proxyLog(`bypass CRASH: ${e.message}`);
+    try { fs.unlinkSync(BYPASS_PID_FILE); } catch {}
+    process.exit(1);
+  });
 
   const server = net.createServer((clientSocket) => {
     const upstream = new net.Socket();
@@ -678,7 +694,7 @@ function runBypassDaemon(proxyPort) {
   });
 
   server.on("error", (e) => {
-    fs.writeFileSync(path.join(CONFIG_DIR, "bypass.error"), e.message);
+    proxyLog(`bypass server error: ${e.message}`);
     process.exit(1);
   });
   server.listen(443, "127.0.0.1", () => {
@@ -691,11 +707,17 @@ function runBypassDaemon(proxyPort) {
     try { fs.closeSync(1); } catch {}
     try { fs.closeSync(2); } catch {}
 
-    setInterval(() => {}, 86400000);
+    // Heartbeat every 60s
+    const hbInterval = setInterval(() => {
+      try { fs.writeFileSync(path.join(CONFIG_DIR, "bypass.heartbeat"), String(Date.now())); } catch {}
+    }, 60000);
 
     const cleanup = () => {
+      proxyLog("bypass daemon shutting down on signal");
+      clearInterval(hbInterval);
       server.close();
       try { fs.unlinkSync(BYPASS_PID_FILE); } catch {}
+      try { fs.unlinkSync(path.join(CONFIG_DIR, "bypass.heartbeat")); } catch {}
       process.exit(0);
     };
     process.on("SIGTERM", cleanup);
@@ -705,6 +727,7 @@ function runBypassDaemon(proxyPort) {
 
 function cleanupBypassFiles() {
   try { fs.unlinkSync(BYPASS_PID_FILE); } catch {}
+  try { fs.unlinkSync(path.join(CONFIG_DIR, "bypass.heartbeat")); } catch {}
 }
 
 function manageHosts(action) {
@@ -921,21 +944,25 @@ function cmdProxyTest(opts = {}) {
 }
 
 function cmdProxyStatus() {
+  const hbAge = (hbFile) => {
+    try {
+      const hb = parseInt(fs.readFileSync(hbFile, "utf8"), 10);
+      return `${Math.round((Date.now() - hb) / 1000)}s ago`;
+    } catch { return "N/A"; }
+  };
   if (isProxyRunning()) {
     const port = fs.readFileSync(PORT_FILE, "utf8").trim();
     const pid = fs.readFileSync(PID_FILE, "utf8").trim();
-    let heartbeat = "N/A";
-    try {
-      const hbFile = path.join(CONFIG_DIR, "proxy.heartbeat");
-      const hb = parseInt(fs.readFileSync(hbFile, "utf8"), 10);
-      heartbeat = `${Math.round((Date.now() - hb) / 1000)}s ago`;
-    } catch {}
     console.log(`local daemon:   running (pid ${pid}, port ${port})`);
-    console.log(`last heartbeat: ${heartbeat}`);
-    console.log(`bypass:         ${isBypassRunning() ? "active" : "stopped"}`);
+    console.log(`  heartbeat:    ${hbAge(path.join(CONFIG_DIR, "proxy.heartbeat"))}`);
   } else {
     console.log("local daemon:   stopped");
-    console.log("bypass:         " + (isBypassRunning() ? "active (stale)" : "stopped"));
+  }
+  if (isBypassRunning()) {
+    console.log(`bypass daemon:  active`);
+    console.log(`  heartbeat:    ${hbAge(path.join(CONFIG_DIR, "bypass.heartbeat"))}`);
+  } else {
+    console.log("bypass daemon:  stopped");
   }
 }
 
