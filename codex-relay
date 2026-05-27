@@ -226,23 +226,37 @@ function startLocalProxy(upstreamUrl, port = 0) {
     server.on("error", reject);
 
     server.listen(port, "127.0.0.1", () => {
+      // Replace startup-only error handler with persistent one
+      server.removeListener("error", reject);
+      server.on("error", (e) => {
+        // Log but don't crash — these are accept-level errors (EMFILE etc.)
+        try { fs.appendFileSync(path.join(CONFIG_DIR, "proxy.error"), `${new Date().toISOString()} ${e.message}\n`); } catch {}
+      });
       const addr = server.address();
       resolve({ server, port: addr.port });
     });
 
     server.on("connection", (clientSocket) => {
-      clientSocket.once("data", async (head) => {
-        const headStr = head.toString();
-        const connectMatch = headStr.match(/^CONNECT (.+):(\d+)/m);
+      clientSocket.once("data", (head) => {
+        handleRequest(clientSocket, head, upstreamUrl);
+      });
+      clientSocket.on("error", () => {}); // prevent crash on client errors
+    });
+  });
+}
 
-        if (!connectMatch) {
-          // Plain HTTP — proxy as-is through upstream
-          forwardHttp(clientSocket, head, upstreamUrl);
-          return;
-        }
+async function handleRequest(clientSocket, head, upstreamUrl) {
+  try {
+    const headStr = head.toString();
+    const connectMatch = headStr.match(/^CONNECT (.+):(\d+)/m);
 
-        const host = connectMatch[1];
-        const port = parseInt(connectMatch[2], 10);
+    if (!connectMatch) {
+      forwardHttp(clientSocket, head, upstreamUrl);
+      return;
+    }
+
+    const host = connectMatch[1];
+    const port = parseInt(connectMatch[2], 10);
 
         // Resolve all IPs and cache if not already cached
         let entry = loadDnsCache()[host];
@@ -345,9 +359,7 @@ function startLocalProxy(upstreamUrl, port = 0) {
         if (!connected) {
           try { clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"); clientSocket.end(); } catch {}
         }
-      });
-    });
-  });
+  } catch {} // prevent handler crash from killing daemon
 }
 
 async function forwardHttp(clientSocket, head, upstreamUrl) {
@@ -513,6 +525,13 @@ function cmdProxyStart() {
 
 function runProxyDaemon(upstreamUrl) {
   process.title = "codex-relay-proxy";
+  process.on("unhandledRejection", (e) => {
+    try { fs.appendFileSync(path.join(CONFIG_DIR, "proxy.error"), `${new Date().toISOString()} unhandled: ${e?.message || e}\n`); } catch {}
+  });
+  process.on("uncaughtException", (e) => {
+    try { fs.appendFileSync(path.join(CONFIG_DIR, "proxy.error"), `${new Date().toISOString()} crash: ${e.message}\n`); } catch {}
+    process.exit(1);
+  });
 
   const REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
 
