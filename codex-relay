@@ -447,8 +447,37 @@ async function cmdDns(args) {
 }
 
 async function cmdInstallSelf(opts = {}) {
-  const binDir = "/usr/local/bin";
-  const dest = path.join(binDir, NAME);
+  // Try each candidate dir: first writable one wins
+  const candidates = [
+    "/usr/local/bin",
+    path.join(os.homedir(), ".local", "bin"),
+    path.join(os.homedir(), "bin"),
+  ];
+
+  let binDir = null;
+  let dest = null;
+
+  for (const dir of candidates) {
+    dest = path.join(dir, NAME);
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      // Test write access by creating a temp file
+      const testFile = path.join(dir, `.${NAME}.write-test`);
+      fs.writeFileSync(testFile, "", { mode: 0o644 });
+      fs.unlinkSync(testFile);
+      binDir = dir;
+      break;
+    } catch {
+      continue;
+    }
+  }
+
+  if (!binDir) {
+    throw new Error(
+      `no writable bin directory found. Tried: ${candidates.join(", ")}.\n` +
+      `  Run with sudo or create a directory: mkdir -p ~/.local/bin && export PATH="$HOME/.local/bin:$PATH"`
+    );
+  }
 
   let scriptContent;
   if (opts.url) {
@@ -463,7 +492,7 @@ async function cmdInstallSelf(opts = {}) {
   }
 
   // Check if already installed — prompt unless --force
-  if (fs.existsSync(dest) && !opts.force) {
+  if (dest && fs.existsSync(dest) && !opts.force) {
     const readline = require("readline");
     const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
     const answer = await new Promise((res) => {
@@ -481,11 +510,33 @@ async function cmdInstallSelf(opts = {}) {
   // Write to bin directory
   try {
     fs.writeFileSync(dest, scriptContent, { mode: 0o755 });
-    info(`installed to ${dest}`);
-  } catch (e) {
-    if (e.code === "EACCES") {
-      throw new Error(`permission denied (${dest}). Try: sudo ${NAME} install`);
+
+    // Check if the binary is findable right now
+    const inPath = process.env.PATH.split(":").some((p) => path.resolve(p) === path.resolve(binDir));
+    let findable = false;
+    try {
+      execSync(`command -v ${NAME}`, { encoding: "utf8", timeout: 2000 }).trim();
+      findable = true;
+    } catch {}
+
+    if (findable && binDir === "/usr/local/bin") {
+      info(`installed to ${dest}`);
+    } else if (findable && inPath) {
+      info(`installed to ${dest}`);
+      info(`  ✓ already on PATH — run: ${NAME} --help`);
+    } else if (inPath) {
+      info(`installed to ${dest}`);
+      info(`  hint: shell cache may need a refresh — run: hash -r  (or restart terminal)`);
+    } else {
+      const s = process.env.SHELL || "";
+      const shellRc = s.includes("zsh") ? "~/.zshrc" : s.includes("bash") ? "~/.bashrc" : "your shell config";
+      info(`installed to ${dest}`);
+      info(`  ⚠ ${binDir} is not in PATH. To add it:`);
+      info(`    echo 'export PATH="${binDir}:\\$PATH"' >> ${shellRc}`);
+      info(`    source ${shellRc}`);
+      info(`  Then: ${NAME} --help`);
     }
+  } catch (e) {
     throw e;
   }
 }
