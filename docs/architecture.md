@@ -183,7 +183,7 @@ codex_apps MCP server (Rust binary, rmcp + reqwest)
 
 2. **代理 IP 的 TLS 阻断**（第二层 — bypass 路径的限制）
 
-   即使 bypass 成功劫持了 DNS 和 TCP（hosts 重定向 + 端口转发），上游代理 IP（如 `48.45.165.225`）在与 `chatgpt.com` 的 Cloudflare 边缘节点进行 TLS 握手时被拒绝（`SSL_ERROR_SYSCALL` / `tls handshake eof`）。
+   即使 bypass 成功劫持了 DNS 和 TCP（hosts 重定向 + 端口转发），上游代理 IP 在与 `chatgpt.com` 的 Cloudflare 边缘节点进行 TLS 握手时被拒绝（`SSL_ERROR_SYSCALL` / `tls handshake eof`）。
 
    注意：这不是 Cloudflare 对代理 IP 的无差别封禁——同一代理访问 `icanhazip.com`（也走 Cloudflare）的 TLS 完全正常。阻断是**针对特定 OpenAI 域名的 TLS 层面检测**。
 
