@@ -25,7 +25,7 @@ codex-relay proxy set http://user:pass@proxy.example.com:8080
 # 2. 预解析 OpenAI 域名（缓存到本地）
 codex-relay dns cache
 
-# 3. 启动本地转发代理（后台守护进程）
+# 3. 启动本地转发代理（含 sudo bypass，解决 MCP server 代理绕过问题）
 codex-relay proxy start
 
 # 4. 运行 codex

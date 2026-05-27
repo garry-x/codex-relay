@@ -751,7 +751,7 @@ function cmdProxyCheck() {
       check("api.openai.com CONNECT", false, cachedIp ? `tunnel failed (cached: ${cachedIp})` : "tunnel failed — run: dns cache");
     }
 
-    // 6b. Full HTTPS (may fail due to Cloudflare TLS blocking)
+    // 6b. Full HTTPS (may fail even if CONNECT works)
     if (tunnelOk) {
       try {
         const out = execSync(
@@ -762,10 +762,10 @@ function cmdProxyCheck() {
         if (code >= 200 && code < 500) {
           check("api.openai.com HTTPS", true, `HTTP ${out}`);
         } else {
-          check("api.openai.com HTTPS", false, `TLS blocked (HTTP ${code || "000"}) — Cloudflare WAF on this proxy IP`);
+          check("api.openai.com HTTPS", false, `TLS handshake failed (HTTP ${code || "000"})`);
         }
       } catch {
-        check("api.openai.com HTTPS", false, "TLS blocked — Cloudflare WAF rejects connections from this proxy IP");
+        check("api.openai.com HTTPS", false, "TLS handshake failed — cause unknown (not a blanket IP block, other Cloudflare sites work)");
       }
     }
   } else {
@@ -1058,6 +1058,8 @@ function cmdRun(args) {
     env.HTTPS_PROXY = `http://127.0.0.1:${localPort}`;
     env.http_proxy = `http://127.0.0.1:${localPort}`;
     env.https_proxy = `http://127.0.0.1:${localPort}`;
+    env.WS_PROXY = `http://127.0.0.1:${localPort}`;
+    env.WSS_PROXY = `http://127.0.0.1:${localPort}`;
     env.NO_PROXY = noProxy;
     env.no_proxy = noProxy;
     info(`using local forward proxy: 127.0.0.1:${localPort}`);
@@ -1069,6 +1071,8 @@ function cmdRun(args) {
       env.HTTPS_PROXY = proxyUrl;
       env.http_proxy = proxyUrl;
       env.https_proxy = proxyUrl;
+      env.WS_PROXY = proxyUrl;
+      env.WSS_PROXY = proxyUrl;
       env.NO_PROXY = noProxy;
       env.no_proxy = noProxy;
       info(`using proxy: ${proxyUrl}`);
