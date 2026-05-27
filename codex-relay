@@ -574,6 +574,8 @@ async function cmdInstall(opts = {}) {
     env.HTTPS_PROXY = proxyUrl;
     env.http_proxy = proxyUrl;
     env.https_proxy = proxyUrl;
+    env.NO_PROXY = "localhost,127.0.0.1,::1,.local";
+    env.no_proxy = "localhost,127.0.0.1,::1,.local";
   }
 
   // Explicit flags — do exactly what was asked
@@ -612,12 +614,16 @@ function cmdRun(args) {
   const env = { ...process.env };
 
   // Prefer local forward proxy if running
+  const noProxy = "localhost,127.0.0.1,::1,.local";
+
   const localPort = getLocalProxyPort();
   if (localPort) {
     env.HTTP_PROXY = `http://127.0.0.1:${localPort}`;
     env.HTTPS_PROXY = `http://127.0.0.1:${localPort}`;
     env.http_proxy = `http://127.0.0.1:${localPort}`;
     env.https_proxy = `http://127.0.0.1:${localPort}`;
+    env.NO_PROXY = noProxy;
+    env.no_proxy = noProxy;
     info(`using local forward proxy: 127.0.0.1:${localPort}`);
   } else {
     const cfg = loadConfig();
@@ -627,6 +633,8 @@ function cmdRun(args) {
       env.HTTPS_PROXY = proxyUrl;
       env.http_proxy = proxyUrl;
       env.https_proxy = proxyUrl;
+      env.NO_PROXY = noProxy;
+      env.no_proxy = noProxy;
       info(`using proxy: ${proxyUrl}`);
     }
   }
