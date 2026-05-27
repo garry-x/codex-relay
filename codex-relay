@@ -544,6 +544,15 @@ function cmdProxyStart() {
 
 function runProxyDaemon(upstreamUrl) {
   process.title = "codex-relay-proxy";
+  proxyLog("daemon started, pid=" + process.pid);
+
+  process.on("beforeExit", (code) => {
+    clearInterval(hbInterval);
+    proxyLog(`daemon exiting, code=${code}`);
+    try { fs.appendFileSync(path.join(CONFIG_DIR, "proxy.error"), `${new Date().toISOString()} exit: code=${code}\n`); } catch {}
+    cleanupProxyFiles();
+  });
+
   process.on("unhandledRejection", (e) => {
     try { fs.appendFileSync(path.join(CONFIG_DIR, "proxy.error"), `${new Date().toISOString()} unhandled: ${e?.message || e}\n`); } catch {}
   });
@@ -551,6 +560,11 @@ function runProxyDaemon(upstreamUrl) {
     try { fs.appendFileSync(path.join(CONFIG_DIR, "proxy.error"), `${new Date().toISOString()} crash: ${e.message}\n`); } catch {}
     process.exit(1);
   });
+
+  // Heartbeat every 60s to confirm daemon is alive
+  const hbInterval = setInterval(() => {
+    try { fs.writeFileSync(path.join(CONFIG_DIR, "proxy.heartbeat"), String(Date.now())); } catch {}
+  }, 60000);
 
   const REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
 
@@ -580,6 +594,8 @@ function runProxyDaemon(upstreamUrl) {
     refreshDnsLoop();
 
     const cleanup = () => {
+      proxyLog("daemon shutting down on signal");
+      clearInterval(hbInterval);
       server.close();
       cleanupProxyFiles();
       process.exit(0);
@@ -886,6 +902,25 @@ function cmdProxyTest(opts = {}) {
   }
 
   if (!allOk) process.exit(1);
+}
+
+function cmdProxyStatus() {
+  if (isProxyRunning()) {
+    const port = fs.readFileSync(PORT_FILE, "utf8").trim();
+    const pid = fs.readFileSync(PID_FILE, "utf8").trim();
+    let heartbeat = "N/A";
+    try {
+      const hbFile = path.join(CONFIG_DIR, "proxy.heartbeat");
+      const hb = parseInt(fs.readFileSync(hbFile, "utf8"), 10);
+      heartbeat = `${Math.round((Date.now() - hb) / 1000)}s ago`;
+    } catch {}
+    console.log(`local daemon:   running (pid ${pid}, port ${port})`);
+    console.log(`last heartbeat: ${heartbeat}`);
+    console.log(`bypass:         ${isBypassRunning() ? "active" : "stopped"}`);
+  } else {
+    console.log("local daemon:   stopped");
+    console.log("bypass:         " + (isBypassRunning() ? "active (stale)" : "stopped"));
+  }
 }
 
 function cmdProxyLogs() {
@@ -1482,6 +1517,7 @@ async function main() {
         case "bypass": cmdProxyBypass(pargs); break;
         case "restart": cmdProxyStop(); cmdProxyStart(); break;
         case "logs": cmdProxyLogs(); break;
+        case "status": cmdProxyStatus(); break;
         case "check": cmdProxyCheck(); break;
         default: die(`usage: ${NAME} proxy {set|show|unset|test|start|stop|restart|bypass|check|logs}`);
       }
