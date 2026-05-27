@@ -5,7 +5,6 @@
 const net = require("net");
 const dns = require("dns").promises;
 const fs = require("fs");
-const fsp = require("fs/promises");
 const path = require("path");
 const os = require("os");
 const { spawn, execSync } = require("child_process");
@@ -17,7 +16,19 @@ const VERSION = "0.2.0";
 
 // When running via sudo, use the original user's home, not /var/root
 const SUDO_USER = process.env.SUDO_USER;
-const REAL_HOME = SUDO_USER ? path.join("/Users", SUDO_USER) : os.homedir();
+const REAL_HOME = (() => {
+  if (!SUDO_USER) return os.homedir();
+  try {
+    const info = require("os").userInfo({ encoding: "utf8" });
+    // macOS: userInfo doesn't take options; try to resolve from /Users or /home
+  } catch {}
+  // Heuristic: check common home dir patterns
+  for (const prefix of ["/Users", "/home"]) {
+    const candidate = path.join(prefix, SUDO_USER);
+    try { if (fs.statSync(candidate).isDirectory()) return candidate; } catch {}
+  }
+  return os.homedir();
+})();
 const CONFIG_DIR = path.join(REAL_HOME, ".codex-relay");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 const DNS_CACHE_FILE = path.join(CONFIG_DIR, "dns.json");
@@ -75,21 +86,31 @@ async function resolveAllIPs(host) {
   try { return await dns.resolve4(host); } catch { return []; }
 }
 
+// In-memory cache to reduce disk I/O on every CONNECT
+let _dnsMemCache = null;
+let _dnsMemCacheTs = 0;
+const DNS_MEM_CACHE_TTL = 30000; // 30 seconds before re-reading from disk
+
 function loadDnsCache() {
+  const now = Date.now();
+  if (_dnsMemCache && (now - _dnsMemCacheTs) < DNS_MEM_CACHE_TTL) return _dnsMemCache;
   try {
     const raw = JSON.parse(fs.readFileSync(DNS_CACHE_FILE, "utf8"));
-    // Migrate old single-IP format
     for (const [host, entry] of Object.entries(raw)) {
       if (entry.ip && !entry.ips) {
         raw[host] = { ips: [{ ip: entry.ip, ok: null, testedAt: null }], ts: entry.ts || 0 };
       }
     }
+    _dnsMemCache = raw;
+    _dnsMemCacheTs = now;
     return raw;
   } catch { return {}; }
 }
 function saveDnsCache(cache) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
   fs.writeFileSync(DNS_CACHE_FILE, JSON.stringify(cache, null, 2));
+  _dnsMemCache = cache;
+  _dnsMemCacheTs = Date.now();
 }
 
 function getBestIp(host) {
@@ -258,43 +279,71 @@ function startLocalProxy(upstreamUrl, port = 0) {
 
           await new Promise((resolve) => {
             const upstreamSocket = new net.Socket();
-            upstreamSocket.setTimeout(4000);
-            upstreamSocket.on("timeout", () => {
+            // TCP connect timeout: 3s to reach upstream proxy
+            const connTimer = setTimeout(() => {
               markIpResult(host, ip, false);
               try { upstreamSocket.destroy(); } catch {}
-              resolve();
-            });
-            upstreamSocket.connect(upPort, upHost, () => {
+              resolve(); // try next IP
+            }, 3000);
+            upstreamSocket.once("connect", () => {
+              clearTimeout(connTimer);
+              // Response timeout: 3s for upstream to reply to CONNECT
+              upstreamSocket.setTimeout(3000);
+              upstreamSocket.on("timeout", () => {
+                markIpResult(host, ip, false);
+                try { clientSocket.write("HTTP/1.1 504 Gateway Timeout\r\n\r\n"); clientSocket.end(); } catch {}
+                try { upstreamSocket.destroy(); } catch {}
+                connected = true;
+                resolve();
+              });
               upstreamSocket.write(modified);
-              upstreamSocket.once("data", (resp) => {
-                const respStr = resp.toString();
+              // Buffer entire upstream HTTP response to avoid TLS stream corruption
+              let respBuf = Buffer.alloc(0);
+              const onData = (chunk) => {
+                respBuf = Buffer.concat([respBuf, chunk]);
+                const headerEnd = respBuf.indexOf("\r\n\r\n");
+                if (headerEnd < 0) return; // need more data
+                upstreamSocket.removeListener("data", onData);
+
+                const respStr = respBuf.toString("utf8", 0, headerEnd + 4);
                 if (respStr.startsWith("HTTP/1.1 200") || respStr.startsWith("HTTP/1.0 200")) {
                   markIpResult(host, ip, true);
+                  // Clear timeout — tunnel is established, let it run indefinitely
+                  upstreamSocket.setTimeout(0);
+                  upstreamSocket.removeAllListeners("timeout");
                   clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+                  const leftover = respBuf.slice(headerEnd + 4);
+                  if (leftover.length > 0) clientSocket.write(leftover);
                   clientSocket.pipe(upstreamSocket);
                   upstreamSocket.pipe(clientSocket);
                   connected = true;
                 } else {
                   markIpResult(host, ip, false);
+                  try { clientSocket.write(respStr); } catch {}
                   upstreamSocket.destroy();
                 }
                 resolve();
-              });
+              };
+              upstreamSocket.on("data", onData);
             });
             upstreamSocket.on("error", () => {
+              if (connected) return;
+              clearTimeout(connTimer);
               markIpResult(host, ip, false);
               try { upstreamSocket.destroy(); } catch {}
-              resolve();
+              resolve(); // try next IP
             });
             clientSocket.on("error", () => {
+              clearTimeout(connTimer);
               try { upstreamSocket.destroy(); } catch {}
               resolve();
             });
+            upstreamSocket.connect(upPort, upHost);
           });
         }
 
         if (!connected) {
-          try { clientSocket.end(); } catch {}
+          try { clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"); clientSocket.end(); } catch {}
         }
       });
     });
@@ -336,7 +385,13 @@ async function forwardHttp(clientSocket, head, upstreamUrl) {
     );
   }
 
-  const upstream = net.connect(upPort, upHost, () => {
+  const upstream = new net.Socket();
+  upstream.setTimeout(10000);
+  upstream.on("timeout", () => {
+    try { clientSocket.end(); } catch {}
+    try { upstream.destroy(); } catch {}
+  });
+  upstream.connect(upPort, upHost, () => {
     upstream.write(modifiedHead);
     clientSocket.pipe(upstream);
     upstream.pipe(clientSocket);
@@ -543,7 +598,8 @@ function runBypassDaemon(proxyPort) {
   process.title = "codex-relay-bypass";
 
   const server = net.createServer((clientSocket) => {
-    const upstream = net.connect(proxyPort, "127.0.0.1", () => {
+    const upstream = new net.Socket();
+    upstream.connect(proxyPort, "127.0.0.1", () => {
       clientSocket.pipe(upstream);
       upstream.pipe(clientSocket);
     });
@@ -751,6 +807,44 @@ function cmdProxyTest(opts = {}) {
     }
   } else if (localPort) {
     console.log(`\nBypass check: stopped — run: sudo ${NAME} proxy bypass`);
+  }
+
+  // codex doctor integration
+  if (localPort && findCodex()) {
+    console.log(`\ncodex doctor:`);
+    try {
+      const env = { ...process.env,
+        HTTPS_PROXY: `http://127.0.0.1:${localPort}`,
+        HTTP_PROXY: `http://127.0.0.1:${localPort}`,
+        http_proxy: `http://127.0.0.1:${localPort}`,
+        https_proxy: `http://127.0.0.1:${localPort}`,
+        WS_PROXY: `http://127.0.0.1:${localPort}`,
+        WSS_PROXY: `http://127.0.0.1:${localPort}`,
+        NO_PROXY: "localhost,127.0.0.1,::1",
+      };
+      const out = execSync(`${findCodex()} doctor`, { encoding: "utf8", timeout: 25000, env });
+      // Extract key lines
+      const lines = out.split("\n");
+      const wsLine = lines.find((l) => l.includes("websocket") && l.includes("connected"));
+      const reachLine = lines.find((l) => l.includes("reachability") && l.includes("provider"));
+      const baseLine = lines.find((l) => l.includes("base URL"));
+      const handshakeLine = lines.find((l) => l.includes("handshake result"));
+      if (wsLine) {
+        const ok = wsLine.includes("✓") || wsLine.includes("connected");
+        console.log(`  ${ok ? "✓" : "✗"} websocket: ${wsLine.replace(/^\s+/, "").replace(/^\S+\s+/, "").trim()}`);
+        if (!ok) allOk = false;
+      }
+      if (handshakeLine) console.log(`    ${handshakeLine.trim()}`);
+      if (reachLine) {
+        const ok = reachLine.includes("✓") || reachLine.includes("reachable");
+        console.log(`  ${ok ? "✓" : "✗"} reachability: ${reachLine.replace(/^\s+/, "").replace(/^\S+\s+/, "").trim()}`);
+        if (!ok) allOk = false;
+      }
+      if (baseLine) console.log(`    ${baseLine.trim()}`);
+    } catch {
+      console.log(`  ✗ codex doctor: timeout or failed to run`);
+      allOk = false;
+    }
   }
 
   if (!allOk) process.exit(1);
