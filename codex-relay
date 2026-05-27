@@ -1431,8 +1431,9 @@ async function main() {
         case "stop": cmdProxyStop(); break;
         case "test": cmdProxyTest(pargs); break;
         case "bypass": cmdProxyBypass(pargs); break;
+        case "restart": cmdProxyStop(); cmdProxyStart(); break;
         case "check": cmdProxyCheck(); break;
-        default: die(`usage: ${NAME} proxy {set|show|unset|test|start|stop|bypass|check}`);
+        default: die(`usage: ${NAME} proxy {set|show|unset|test|start|stop|restart|bypass|check}`);
       }
       break;
     }
