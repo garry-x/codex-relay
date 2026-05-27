@@ -191,10 +191,47 @@ function startLocalProxy(upstreamUrl, port = 0) {
   });
 }
 
-function forwardHttp(clientSocket, head, upstreamUrl) {
-  const { host: upHost, port: upPort } = parseProxyUrl(upstreamUrl);
+async function forwardHttp(clientSocket, head, upstreamUrl) {
+  const headStr = head.toString();
+
+  // Parse target host from HTTP request line: GET http://host/path HTTP/1.1
+  const reqMatch = headStr.match(/^([A-Z]+) http:\/\/([^/:]+)(:\d+)?(\/[^\s]*)? HTTP\/[0-9.]+\r\n/m);
+  let modifiedHead = headStr;
+
+  if (reqMatch) {
+    const host = reqMatch[2];
+    let ip = getCachedIp(host);
+    if (!ip) {
+      ip = await resolveHost(host);
+      if (ip) {
+        const cache = loadDnsCache();
+        cache[host] = { ip, ts: Date.now() };
+        saveDnsCache(cache);
+      }
+    }
+    if (ip) {
+      // Rewrite request URL to use IP so upstream proxy doesn't need DNS
+      const portSuffix = reqMatch[3] || "";
+      const path = reqMatch[4] || "/";
+      modifiedHead = headStr.replace(
+        `http://${host}${portSuffix}${path}`,
+        `http://${ip}${portSuffix}${path}`
+      );
+    }
+  }
+
+  const { host: upHost, port: upPort, auth } = parseProxyUrl(upstreamUrl);
+
+  // Inject Proxy-Authorization if upstream needs it and request lacks it
+  if (auth && !/Proxy-Authorization:/im.test(modifiedHead)) {
+    modifiedHead = modifiedHead.replace(
+      /\r\n\r\n$/,
+      `\r\nProxy-Authorization: Basic ${auth}\r\n\r\n`
+    );
+  }
+
   const upstream = net.connect(upPort, upHost, () => {
-    upstream.write(head);
+    upstream.write(modifiedHead);
     clientSocket.pipe(upstream);
     upstream.pipe(clientSocket);
   });
