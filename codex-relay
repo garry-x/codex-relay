@@ -189,12 +189,12 @@ async function testIp(ip, host, port, upstreamUrl) {
   });
 }
 
-async function refreshDnsCache(domains = OPENAI_DOMAINS, proxyUrl) {
+async function refreshDnsCache(domains = OPENAI_DOMAINS, proxyUrl, logCb) {
+  const log = logCb || ((...a) => console.log(...a));
   if (!proxyUrl) {
     const cfg = loadConfig();
     proxyUrl = cfg.https || cfg.http;
   }
-  const cache = loadDnsCache();
   for (const host of domains) {
     const ips = await resolveAllIPs(host);
     if (ips.length > 0) {
@@ -206,12 +206,12 @@ async function refreshDnsCache(domains = OPENAI_DOMAINS, proxyUrl) {
           results.push(ok ? "✓" : "✗");
           markIpResult(host, ip, ok);
         }
-        console.log(`  ${host.padEnd(30)} → ${ips.join(", ")}  [${results.join(" ")}]`);
+        log(`  ${host.padEnd(30)} → ${ips.join(", ")}  [${results.join(" ")}]`);
       } else {
-        console.log(`  ${host.padEnd(30)} → ${ips.join(", ")}  (no proxy to test)`);
+        log(`  ${host.padEnd(30)} → ${ips.join(", ")}  (no proxy to test)`);
       }
     } else {
-      console.log(`  ${host.padEnd(30)} → FAILED`);
+      log(`  ${host.padEnd(30)} → FAILED`);
     }
   }
   return loadDnsCache();
@@ -244,8 +244,7 @@ function startLocalProxy(upstreamUrl, port = 0) {
       // Replace startup-only error handler with persistent one
       server.removeListener("error", reject);
       server.on("error", (e) => {
-        // Log but don't crash — these are accept-level errors (EMFILE etc.)
-        try { fs.appendFileSync(path.join(CONFIG_DIR, "proxy.error"), `${new Date().toISOString()} ${e.message}\n`); } catch {}
+        proxyLog(`server error: ${e.message}`);
       });
       const addr = server.address();
       resolve({ server, port: addr.port });
@@ -342,6 +341,9 @@ async function handleRequest(clientSocket, head, upstreamUrl) {
                   proxyLog(`CONNECT ${host}:${port} → ${ip} OK`);
                   upstreamSocket.setTimeout(0);
                   upstreamSocket.removeAllListeners("timeout");
+                  // TCP keepalive to prevent upstream proxy idle timeout
+                  upstreamSocket.setKeepAlive(true, 30000);
+                  clientSocket.setKeepAlive(true, 30000);
                   clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
                   const leftover = respBuf.slice(headerEnd + 4);
                   if (leftover.length > 0) clientSocket.write(leftover);
@@ -378,7 +380,10 @@ async function handleRequest(clientSocket, head, upstreamUrl) {
           proxyLog(`CONNECT ${host}:${port} FAIL all IPs tried: ${triedIps.join(", ")}`);
           try { clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"); clientSocket.end(); } catch {}
         }
-  } catch {} // prevent handler crash from killing daemon
+  } catch (e) {
+    proxyLog(`request error: ${e.message}`);
+    try { clientSocket.end(); } catch {}
+  }
 }
 
 async function forwardHttp(clientSocket, head, upstreamUrl) {
@@ -423,6 +428,8 @@ async function forwardHttp(clientSocket, head, upstreamUrl) {
     try { upstream.destroy(); } catch {}
   });
   upstream.connect(upPort, upHost, () => {
+    upstream.setKeepAlive(true, 30000);
+    clientSocket.setKeepAlive(true, 30000);
     upstream.write(modifiedHead);
     clientSocket.pipe(upstream);
     upstream.pipe(clientSocket);
@@ -546,18 +553,25 @@ function runProxyDaemon(upstreamUrl) {
   process.title = "codex-relay-proxy";
   proxyLog("daemon started, pid=" + process.pid);
 
+  // Prevent SIGHUP from killing daemon when terminal closes
+  process.on("SIGHUP", () => {
+    proxyLog("received SIGHUP — ignoring");
+  });
+  process.on("SIGPIPE", () => {
+    proxyLog("received SIGPIPE — ignoring");
+  });
+
   process.on("beforeExit", (code) => {
     clearInterval(hbInterval);
     proxyLog(`daemon exiting, code=${code}`);
-    try { fs.appendFileSync(path.join(CONFIG_DIR, "proxy.error"), `${new Date().toISOString()} exit: code=${code}\n`); } catch {}
     cleanupProxyFiles();
   });
 
   process.on("unhandledRejection", (e) => {
-    try { fs.appendFileSync(path.join(CONFIG_DIR, "proxy.error"), `${new Date().toISOString()} unhandled: ${e?.message || e}\n`); } catch {}
+    proxyLog(`unhandled rejection: ${e?.message || e}`);
   });
   process.on("uncaughtException", (e) => {
-    try { fs.appendFileSync(path.join(CONFIG_DIR, "proxy.error"), `${new Date().toISOString()} crash: ${e.message}\n`); } catch {}
+    proxyLog(`CRASH: ${e.message}`);
     process.exit(1);
   });
 
@@ -573,7 +587,7 @@ function runProxyDaemon(upstreamUrl) {
       await new Promise((r) => setTimeout(r, REFRESH_INTERVAL));
       try {
         // Refresh: resolve all IPs and test connectivity
-        await refreshDnsCache(OPENAI_DOMAINS, upstreamUrl);
+        await refreshDnsCache(OPENAI_DOMAINS, upstreamUrl, (msg) => proxyLog(msg));
       } catch {} // silent — proxy still works with stale cache
     }
   }
@@ -654,6 +668,8 @@ function runBypassDaemon(proxyPort) {
   const server = net.createServer((clientSocket) => {
     const upstream = new net.Socket();
     upstream.connect(proxyPort, "127.0.0.1", () => {
+      upstream.setKeepAlive(true, 30000);
+      clientSocket.setKeepAlive(true, 30000);
       clientSocket.pipe(upstream);
       upstream.pipe(clientSocket);
     });
