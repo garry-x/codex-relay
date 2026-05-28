@@ -29,7 +29,7 @@ codex  ──→  静态代理  ──→  OpenAI
 codex-relay proxy set http://user:pass@your-proxy.com:8080
 
 # 2. 验证代理连通性
-codex-relay proxy test
+codex-relay proxy check
 
 # 3. 通过代理运行 codex
 codex-relay run
@@ -44,8 +44,7 @@ codex-relay run
 | `proxy set <url>` | 配置上游代理，持久化到 `~/.codex-relay/config.json` |
 | `proxy show` | 查看当前配置 |
 | `proxy unset` | 清除代理配置 |
-| `proxy test` | 通过 curl 测试代理是否可达 |
-| `proxy check` | 全面诊断（代理配置、curl、api.openai.com 可达性、npm、codex CLI） |
+| `proxy check [--url URL] [--timeout S]` | 全面诊断：代理配置、连通性（延迟 + HTTP 状态码）、npm、codex CLI |
 | `run <args...>` | 自动注入代理环境变量，运行 codex |
 
 ---
@@ -110,7 +109,7 @@ codex-relay proxy set http://<TOKEN>@relay.example.com:8080
 codex-relay proxy set https://<TOKEN>@relay.example.com:8443
 
 # 3. 验证连通性
-codex-relay proxy test
+codex-relay proxy check
 
 # 4. 通过代理运行 codex
 codex-relay run
@@ -139,8 +138,7 @@ codex-relay
     proxy set <url>                    配置上游代理
     proxy show                         查看当前配置
     proxy unset                        清除配置
-    proxy test [--url URL]             连通性测试
-    proxy check                        全面诊断
+    proxy check [--url URL] [--timeout S]  全面诊断 & 连通性测试
 
   链式中转:
     chain config --listen --upstream   保存中转配置

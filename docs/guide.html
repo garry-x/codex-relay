@@ -249,7 +249,7 @@
   </li>
   <li>
     <strong>验证连通性</strong>
-    <pre><span class="cmd">codex-relay proxy test</span></pre>
+    <pre><span class="cmd">codex-relay proxy check</span></pre>
     输出示例：
     <pre><span class="out">Proxy:    http://user:pass@host:47453
 Test URL: https://ipv4.icanhazip.com
@@ -272,8 +272,7 @@ Result:   OK — proxy is reachable</span></pre>
   <tr><td><code>proxy set &lt;url&gt;</code></td><td>配置上游代理，持久化保存</td></tr>
   <tr><td><code>proxy show</code></td><td>查看当前配置和生效的代理</td></tr>
   <tr><td><code>proxy unset</code></td><td>清除代理配置</td></tr>
-  <tr><td><code>proxy test [--url URL]</code></td><td>通过 curl 测试代理连通性</td></tr>
-  <tr><td><code>proxy check</code></td><td>全面诊断：代理、curl、api.openai.com、npm、codex</td></tr>
+  <tr><td><code>proxy check [--url URL] [--timeout S]</code></td><td>全面诊断：代理配置、连通性（延迟+状态码）、npm、codex</td></tr>
   <tr><td><code>run &lt;args...&gt;</code></td><td>注入代理环境变量并运行 codex</td></tr>
 </table>
 
@@ -334,7 +333,7 @@ Result:   OK — proxy is reachable</span></pre>
   </li>
   <li>
     <strong>验证连通性</strong>
-    <pre><span class="cmd">codex-relay proxy test</span></pre>
+    <pre><span class="cmd">codex-relay proxy check</span></pre>
   </li>
   <li>
     <strong>运行 codex</strong>
@@ -392,7 +391,7 @@ Result:   OK — proxy is reachable</span></pre>
 
 <span class="out">  ✓ proxy config (http://user:pass@host:47453)
   ✓ curl (available)
-  ✓ api.openai.com reachable (HTTP 421)
+  ✓ proxy connectivity (HTTP 421, 1143ms → https://api.openai.com)
   ✓ npm (available)
   ✓ codex CLI (codex-cli 0.133.0)
 

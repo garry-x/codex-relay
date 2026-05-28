@@ -45,8 +45,7 @@ codex → 链式中转服务器 → 静态代理 → OpenAI
 - `proxy set <url>` — 保存代理配置
 - `proxy show` — 显示当前配置和生效的代理
 - `proxy unset` — 清除配置
-- `proxy test` — curl 连通性测试
-- `proxy check` — 诊断：代理配置、curl、api.openai.com、npm、codex CLI
+- `proxy check [--url URL] [--timeout S]` — 全面诊断：代理配置、连通性（延迟 + HTTP 状态码）、npm、codex CLI
 
 ### chain relay — 链式中转服务器
 
@@ -145,7 +144,7 @@ codex-relay proxy check
 curl -v --proxy http://user:pass@host:8080 https://api.openai.com -o /dev/null
 
 # 通过 codex-relay 测试
-codex-relay proxy test
+codex-relay proxy check
 ```
 
 ### 链式中转日志

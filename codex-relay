@@ -97,6 +97,47 @@ function codexVersion() {
   try { return execSync(`"${bin}" --version`, { encoding: "utf8", timeout: 5000 }).trim(); } catch { return null; }
 }
 
+// Detect the shell config file for PATH setup.
+// Returns { rc: absolute path, name: display name, home: user home dir }.
+function detectShellRc() {
+  let shell = process.env.SHELL || "";
+  let home = os.homedir();
+
+  // When running via sudo, resolve the original user's data
+  if (SUDO_USER) {
+    for (const prefix of ["/Users", "/home"]) {
+      const candidate = path.join(prefix, SUDO_USER);
+      try { if (fs.statSync(candidate).isDirectory()) { home = candidate; break; } } catch {}
+    }
+    // Get original user's shell
+    try {
+      if (process.platform === "darwin") {
+        const out = execSync(`dscl . -read /Users/${SUDO_USER} UserShell 2>/dev/null`, { encoding: "utf8", timeout: 2000 });
+        const m = out.match(/UserShell:\s*(\S+)/);
+        if (m) shell = m[1];
+      } else {
+        shell = execSync(`getent passwd ${SUDO_USER} 2>/dev/null | cut -d: -f7`, { encoding: "utf8", timeout: 2000 }).trim() || shell;
+      }
+    } catch {}
+  }
+
+  const isBash = shell.includes("bash");
+  const isZsh = shell.includes("zsh");
+
+  if (isZsh) {
+    return { rc: path.join(home, ".zshrc"), name: "~/.zshrc", home };
+  }
+  if (isBash) {
+    // macOS bash sources .bash_profile for login shells; Linux uses .bashrc
+    const bashProfile = path.join(home, ".bash_profile");
+    if (fs.existsSync(bashProfile) || process.platform === "darwin") {
+      return { rc: bashProfile, name: "~/.bash_profile", home };
+    }
+    return { rc: path.join(home, ".bashrc"), name: "~/.bashrc", home };
+  }
+  return { rc: path.join(home, ".profile"), name: "~/.profile", home };
+}
+
 // Parse proxy URL: http://[user:pass@]host:port
 function parseProxyUrl(url) {
   const schemeMatch = String(url).match(/^(https?):\/\//);
@@ -383,56 +424,6 @@ function cmdProxyUnset() {
   info("proxy configuration cleared.");
 }
 
-function cmdProxyTest(opts = {}) {
-  const testUrl = opts.url || "https://ipv4.icanhazip.com";
-  const timeout = opts.timeout || 10;
-
-  let proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy ||
-                 process.env.HTTP_PROXY || process.env.http_proxy;
-
-  if (!proxyUrl) {
-    const cfg = loadConfig();
-    proxyUrl = cfg.https || cfg.http;
-  }
-
-  if (!proxyUrl) {
-    console.log(`Proxy:    (none configured)`);
-    console.log(`Test URL: ${testUrl}`);
-    console.log(`Result:   FAIL — No proxy configured.`);
-    process.exit(1);
-  }
-
-  console.log(`Proxy:    ${proxyUrl}`);
-  console.log(`Test URL: ${testUrl}`);
-
-  let allOk = true;
-  const start = Date.now();
-  try {
-    const out = execSync(
-      `curl -s -o /dev/null -w '%{http_code}' --proxy '${proxyUrl}' --connect-timeout ${timeout} --max-time ${timeout} '${testUrl}'`,
-      { encoding: "utf8", timeout: (timeout + 5) * 1000 }
-    ).trim();
-    const latency = Date.now() - start;
-    console.log(`Status:   ${out}`);
-    console.log(`Latency:  ${latency}ms`);
-    const code = parseInt(out, 10);
-    if (code >= 200 && code < 500) {
-      console.log(`Result:   OK — proxy is reachable`);
-    } else {
-      console.log(`Result:   FAIL — got status ${out}`);
-      allOk = false;
-    }
-  } catch {
-    const latency = Date.now() - start;
-    console.log(`Status:   000`);
-    console.log(`Latency:  ${latency}ms`);
-    console.log(`Result:   FAIL — could not connect`);
-    allOk = false;
-  }
-
-  if (!allOk) process.exit(1);
-}
-
 function chainConfigFromOpts(cfg, opts = {}) {
   const chain = cfg.chain || {};
   return {
@@ -624,7 +615,10 @@ function cmdChain(args) {
   }
 }
 
-function cmdProxyCheck() {
+function cmdProxyCheck(opts = {}) {
+  const testUrl = opts.url || "https://api.openai.com";
+  const timeout = opts.timeout || 10;
+
   const issues = [];
   const ok = [];
 
@@ -645,24 +639,26 @@ function cmdProxyCheck() {
 
   // 2. curl available
   const haveCurl = !!shutil("curl");
-  check("curl", haveCurl, haveCurl ? "available" : "not found — required for proxy test");
+  check("curl", haveCurl, haveCurl ? "available" : "not found — required for proxy check");
 
-  // 3. Upstream proxy connectivity
+  // 3. Proxy connectivity
   if (proxyUrl && haveCurl) {
+    const start = Date.now();
     try {
       const out = execSync(
-        `curl -s -o /dev/null -w '%{http_code}' --proxy '${proxyUrl}' --connect-timeout 5 --max-time 10 'https://api.openai.com'`,
-        { encoding: "utf8", timeout: 15000 }
+        `curl -s -o /dev/null -w '%{http_code}' --proxy '${proxyUrl}' --connect-timeout ${timeout} --max-time ${timeout} '${testUrl}'`,
+        { encoding: "utf8", timeout: (timeout + 5) * 1000 }
       ).trim();
+      const latency = Date.now() - start;
       const code = parseInt(out, 10);
-      check("api.openai.com reachable", code >= 200 && code < 500, `HTTP ${out}`);
+      check("proxy connectivity", code >= 200 && code < 500, `HTTP ${out}, ${latency}ms → ${testUrl}`);
     } catch {
-      check("api.openai.com reachable", false, "connection failed — check proxy URL or network");
+      check("proxy connectivity", false, `connection failed → ${testUrl}`);
     }
   } else if (!haveCurl) {
-    check("api.openai.com reachable", false, "curl not available");
+    check("proxy connectivity", false, "curl not available");
   } else {
-    check("api.openai.com reachable", false, "no proxy configured");
+    check("proxy connectivity", false, "no proxy configured");
   }
 
   // 4. npm available
@@ -686,6 +682,8 @@ function cmdProxyCheck() {
   }
   console.log("");
   console.log(`${ok.length} OK, ${issues.length} issue${issues.length !== 1 ? "s" : ""}`);
+
+  if (issues.length > 0) process.exit(1);
 }
 
 function shutil(name) {
@@ -693,9 +691,12 @@ function shutil(name) {
 }
 
 async function cmdInstallSelf(opts = {}) {
-  // Try each candidate dir: first writable one wins
+  const isRoot = process.getuid && process.getuid() === 0;
+
+  // Candidate install directories: first writable one wins
   const candidates = [
     "/usr/local/bin",
+    ...(isRoot ? ["/usr/local/sbin"] : []),
     path.join(os.homedir(), ".local", "bin"),
     path.join(os.homedir(), "bin"),
   ];
@@ -707,7 +708,6 @@ async function cmdInstallSelf(opts = {}) {
     dest = path.join(dir, NAME);
     try {
       fs.mkdirSync(dir, { recursive: true });
-      // Test write access by creating a temp file
       const testFile = path.join(dir, `.${NAME}.write-test`);
       fs.writeFileSync(testFile, "", { mode: 0o644 });
       fs.unlinkSync(testFile);
@@ -727,13 +727,11 @@ async function cmdInstallSelf(opts = {}) {
 
   let scriptContent;
   if (opts.url) {
-    // Download from URL
     info(`downloading from ${opts.url} ...`);
     const resp = await fetch(opts.url);
     if (!resp.ok) die(`download failed: ${resp.status}`);
     scriptContent = await resp.text();
   } else {
-    // Copy self
     scriptContent = fs.readFileSync(SCRIPT_PATH, "utf8");
   }
 
@@ -765,22 +763,46 @@ async function cmdInstallSelf(opts = {}) {
       findable = true;
     } catch {}
 
-    if (findable && binDir === "/usr/local/bin") {
+    const { rc, name: shellRc, home } = detectShellRc();
+
+    if (findable && !SUDO_USER) {
       info(`installed to ${dest}`);
-    } else if (findable && inPath) {
-      info(`installed to ${dest}`);
-      info(`  ✓ already on PATH — run: ${NAME} --help`);
+      info(`  ✓ on PATH — run: ${NAME} --help`);
+    } else if (findable && SUDO_USER) {
+      info(`installed to ${dest} (system-wide)`);
     } else if (inPath) {
       info(`installed to ${dest}`);
-      info(`  hint: shell cache may need a refresh — run: hash -r  (or restart terminal)`);
+      info(`  hint: refresh shell cache — run: hash -r`);
     } else {
-      const s = process.env.SHELL || "";
-      const shellRc = s.includes("zsh") ? "~/.zshrc" : s.includes("bash") ? "~/.bashrc" : "your shell config";
+      // Not on PATH — provide exact setup instructions
+      const exportLine = `export PATH="${binDir}:\\$PATH"`;
+
       info(`installed to ${dest}`);
-      info(`  ⚠ ${binDir} is not in PATH. To add it:`);
-      info(`    echo 'export PATH="${binDir}:\\$PATH"' >> ${shellRc}`);
+      info(`  bin directory ${binDir} is not on PATH. To add it:`);
+      info(``);
+      info(`    echo '${exportLine}' >> ${shellRc}`);
       info(`    source ${shellRc}`);
-      info(`  Then: ${NAME} --help`);
+      info(``);
+
+      // For macOS bash users, also mention sourcing from .bash_profile
+      if (shellRc.endsWith(".bashrc") && !fs.existsSync(rc)) {
+        const bp = path.join(home, ".bash_profile");
+        if (fs.existsSync(bp)) {
+          info(`  note: macOS bash loads ~/.bash_profile. Make sure it sources ~/.bashrc:`);
+          info(`    echo '[ -f ~/.bashrc ] && source ~/.bashrc' >> ~/.bash_profile`);
+        }
+      }
+
+      // When running via sudo, remind about the original user
+      if (SUDO_USER) {
+        info(`  note: the PATH change above applies to user ${SUDO_USER}, not root`);
+      }
+
+      if (SUDO_USER) {
+        info(`  After setup, run as ${SUDO_USER}: ${NAME} --help`);
+      } else {
+        info(`  Then: ${NAME} --help`);
+      }
     }
   } catch (e) {
     throw e;
@@ -898,15 +920,14 @@ function printHelp() {
 
   Quick start (direct mode):
     ${NAME} proxy set http://user:pass@host:8080
-    ${NAME} proxy test                               # verify proxy works
+    ${NAME} proxy check                               # verify proxy works
     ${NAME} run chat                                 # codex through proxy
 
   Commands:
     ${NAME} proxy set <url>                          - configure upstream proxy
     ${NAME} proxy show                               - show current config
     ${NAME} proxy unset                              - clear proxy config
-    ${NAME} proxy test [--url URL] [--timeout S]     - test connectivity
-    ${NAME} proxy check                              - check for potential issues
+    ${NAME} proxy check [--url URL] [--timeout S]     - full diagnostic & connectivity
     ${NAME} chain config --listen 0.0.0.0:8080 \\
       --upstream http://proxy-a:8080,direct          - save chain relay config
     ${NAME} chain token generate                     - generate and save relay token
@@ -979,9 +1000,8 @@ async function main() {
         case "set": cmdProxySet(pargs._[0]); break;
         case "show": cmdProxyShow(); break;
         case "unset": cmdProxyUnset(); break;
-        case "test": cmdProxyTest(pargs); break;
-        case "check": cmdProxyCheck(); break;
-        default: die(`usage: ${NAME} proxy {set|show|unset|test|check}`);
+        case "check": cmdProxyCheck(pargs); break;
+        default: die(`usage: ${NAME} proxy {set|show|unset|check}`);
       }
       break;
     }
