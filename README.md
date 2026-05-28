@@ -125,7 +125,6 @@ codex-relay run
 | `chain start / stop / restart` | 管理中转守护进程 |
 | `chain status` | 查看守护进程状态 |
 | `chain logs` | 查看请求日志 |
-| `chain serve --listen --upstream [--token]` | 前台运行中转服务 |
 
 ---
 
@@ -143,7 +142,6 @@ codex-relay
   链式中转:
     chain config --listen --upstream   保存中转配置
     chain token generate               生成访问 token
-    chain serve --listen --upstream    前台运行
     chain start / stop / restart       后台守护进程
     chain status / logs                状态与日志
 

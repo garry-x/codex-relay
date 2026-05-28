@@ -426,9 +426,15 @@ function cmdProxyUnset() {
 
 function chainConfigFromOpts(cfg, opts = {}) {
   const chain = cfg.chain || {};
+  const upstreams = opts.upstream ? chainUpstreams(opts.upstream)
+    : chain.upstreams?.length ? chain.upstreams
+    : chain.upstream ? [chain.upstream]
+    : cfg.http ? [cfg.http]
+    : cfg.https ? [cfg.https]
+    : [];
   return {
     listen: opts.listen || chain.listen || "127.0.0.1:8080",
-    upstreams: opts.upstream ? chainUpstreams(opts.upstream) : chain.upstreams || (chain.upstream ? [chain.upstream] : []),
+    upstreams,
     token: opts.token || "",
     tokenHash: opts.token ? "" : (chain.token_hash || cfg.chain_token_hash || cfg.chain_token || ""),
     tlsCert: opts["tls-cert"] || chain.tls_cert || "",
@@ -467,7 +473,7 @@ function runChainDaemon() {
   process.title = "codex-relay-chain";
   const cfg = loadConfig();
   const opts = chainConfigFromOpts(cfg);
-  if (!opts.upstreams.length) die("no chain upstream configured. Run: codex-relay chain config --upstream <url|direct>");
+  if (!opts.upstreams.length) die("no upstream configured. Run: codex-relay proxy set <url> or chain config --upstream <url|direct>");
 
   process.on("SIGHUP", () => chainLog("received SIGHUP — ignoring"));
   process.on("unhandledRejection", (e) => chainLog(`unhandled rejection: ${e?.message || e}`));
@@ -561,13 +567,6 @@ function cmdChain(args) {
   const cfg = loadConfig();
 
   switch (action) {
-    case "serve": {
-      if (opts._[0] && !opts.upstream) opts.upstream = opts._[0];
-      const chainOpts = chainConfigFromOpts(cfg, opts);
-      if (!chainOpts.upstreams.length) die(`usage: ${NAME} chain serve --listen 0.0.0.0:8080 --upstream <static-proxy-url|direct> [--token TOKEN]`);
-      startChainRelay(chainOpts);
-      break;
-    }
     case "config": {
       const chain = saveChainConfig(opts);
       console.log(JSON.stringify(chain, null, 2));
@@ -611,7 +610,7 @@ function cmdChain(args) {
       break;
     }
     default:
-      die(`usage: ${NAME} chain {config|show|serve|start|stop|restart|status|logs|token}`);
+      die(`usage: ${NAME} chain {config|show|start|stop|restart|status|logs|token}`);
   }
 }
 
@@ -932,8 +931,6 @@ function printHelp() {
       --upstream http://proxy-a:8080,direct          - save chain relay config
     ${NAME} chain token generate                     - generate and save relay token
     ${NAME} chain start|stop|status|logs             - manage chain relay daemon
-    ${NAME} chain serve --listen 0.0.0.0:8080 \\
-      --upstream http://user:pass@static-proxy:8080  - run chain relay (foreground)
     ${NAME} install [--force]                        - install both codex-relay & codex CLI
     ${NAME} install --update                         - update codex CLI
     ${NAME} install --version X                      - install specific codex version
