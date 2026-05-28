@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>codex-relay 使用指南</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --card: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --orange: #d2991d;
+    --red: #f85149;
+    --purple: #a371f7;
+    --code-bg: #1c2128;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+  }
+  .container { max-width: 900px; margin: 0 auto; padding: 40px 24px 80px; }
+
+  /* Header */
+  header {
+    text-align: center;
+    padding: 60px 0 40px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 48px;
+  }
+  header h1 {
+    font-size: 2.4em;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    background: linear-gradient(135deg, var(--accent), var(--purple));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  header p {
+    color: var(--muted);
+    font-size: 1.1em;
+    margin-top: 12px;
+  }
+  .badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 0.8em;
+    font-weight: 500;
+    margin: 0 4px;
+  }
+  .badge-node { background: rgba(63,185,80,0.15); color: var(--green); }
+  .badge-zero { background: rgba(163,113,247,0.15); color: var(--purple); }
+
+  /* Sections */
+  h2 {
+    font-size: 1.6em;
+    margin: 48px 0 16px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 {
+    font-size: 1.2em;
+    margin: 32px 0 12px;
+    color: var(--accent);
+  }
+  p { margin: 12px 0; color: var(--text); }
+  .muted { color: var(--muted); font-size: 0.95em; }
+
+  /* Cards */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 24px;
+    margin: 20px 0;
+  }
+  .card-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin: 20px 0;
+  }
+  @media (max-width: 640px) { .card-grid { grid-template-columns: 1fr; } }
+
+  /* Architecture diagrams */
+  .arch {
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.9em;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px 24px;
+    margin: 16px 0;
+    overflow-x: auto;
+    white-space: pre;
+    line-height: 1.8;
+    color: var(--text);
+  }
+  .arch .arrow { color: var(--green); }
+  .arch .node { color: var(--accent); font-weight: 600; }
+  .arch .target { color: var(--orange); }
+
+  /* Code blocks */
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    overflow-x: auto;
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.88em;
+    line-height: 1.7;
+    margin: 12px 0;
+  }
+  code {
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.9em;
+  }
+  pre .c { color: var(--muted); }
+  pre .cmd { color: var(--accent); }
+  pre .val { color: var(--orange); }
+  pre .out { color: var(--green); }
+
+  /* Steps */
+  .steps { counter-reset: step; list-style: none; padding: 0; }
+  .steps li {
+    counter-increment: step;
+    padding: 12px 0 12px 40px;
+    position: relative;
+  }
+  .steps li::before {
+    content: counter(step);
+    position: absolute;
+    left: 0;
+    top: 10px;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.8em;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  th { color: var(--muted); font-weight: 600; font-size: 0.88em; text-transform: uppercase; }
+  td code { color: var(--accent); }
+
+  /* Tags */
+  .tag {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.78em;
+    font-weight: 600;
+  }
+  .tag-server { background: rgba(248,81,73,0.15); color: var(--red); }
+  .tag-client { background: rgba(63,185,80,0.15); color: var(--green); }
+
+  /* Footer */
+  footer {
+    text-align: center;
+    padding: 40px 0 20px;
+    color: var(--muted);
+    font-size: 0.88em;
+    border-top: 1px solid var(--border);
+    margin-top: 60px;
+  }
+
+  hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
+</style>
+</head>
+<body>
+
+<div class="container">
+
+<header>
+  <h1>codex-relay</h1>
+  <p>OpenAI Codex CLI 代理包装器</p>
+  <p style="margin-top:8px">
+    <span class="badge badge-node">Node.js &ge; 18</span>
+    <span class="badge badge-zero">零依赖</span>
+  </p>
+</header>
+
+<!-- ============================================================ -->
+<h2>概述</h2>
+
+<p>codex-relay 提供两种代理模式，解决特定网络环境下 codex 无法直接访问 OpenAI API 的问题。</p>
+
+<div class="card-grid">
+  <div class="card">
+    <h3 style="margin-top:0">直连模式</h3>
+    <div class="arch"><span class="node">codex</span> <span class="arrow">──</span> <span class="node">静态代理</span> <span class="arrow">──</span> <span class="target">OpenAI</span></div>
+    <p class="muted">本机直接访问静态 HTTP 代理，通过它连接 OpenAI。配置后 <code>run</code> 命令自动注入环境变量。</p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">链式中转模式</h3>
+    <div class="arch"><span class="node">codex</span> <span class="arrow">──</span> <span class="node">中转服务器</span> <span class="arrow">──</span> <span class="node">静态代理</span> <span class="arrow">──</span> <span class="target">OpenAI</span></div>
+    <p class="muted">本机无法直连静态代理时，通过中间服务器转发。中转服务器做 token 认证和代理转发。</p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2>安装</h2>
+
+<pre><span class="c"># 下载脚本后执行安装（自动选择可写 bin 目录）</span>
+<span class="cmd">./codex-relay install</span>
+
+<span class="c"># 强制覆盖安装</span>
+<span class="cmd">./codex-relay install --force</span>
+
+<span class="c"># 仅更新 Codex CLI</span>
+<span class="cmd">./codex-relay install --update</span></pre>
+
+<p class="muted">依赖：Node.js &ge; 18、curl、npm。安装后确认目标目录在 PATH 中。</p>
+
+<!-- ============================================================ -->
+<h2>模式一：直连</h2>
+
+<h3>配置流程</h3>
+
+<ol class="steps">
+  <li>
+    <strong>配置上游代理</strong>
+    <pre><span class="cmd">codex-relay proxy set</span> <span class="val">http://user:pass@your-proxy.com:8080</span></pre>
+    配置持久化到 <code>~/.codex-relay/config.json</code>。
+  </li>
+  <li>
+    <strong>验证连通性</strong>
+    <pre><span class="cmd">codex-relay proxy test</span></pre>
+    输出示例：
+    <pre><span class="out">Proxy:    http://user:pass@host:47453
+Test URL: https://ipv4.icanhazip.com
+Status:   200
+Latency:  1153ms
+Result:   OK — proxy is reachable</span></pre>
+  </li>
+  <li>
+    <strong>运行 codex</strong>
+    <pre><span class="cmd">codex-relay run</span>
+<span class="c"># 或直接透传</span>
+<span class="cmd">codex-relay chat</span></pre>
+  </li>
+</ol>
+
+<h3>涉及命令</h3>
+
+<table>
+  <tr><th>命令</th><th>用途</th></tr>
+  <tr><td><code>proxy set &lt;url&gt;</code></td><td>配置上游代理，持久化保存</td></tr>
+  <tr><td><code>proxy show</code></td><td>查看当前配置和生效的代理</td></tr>
+  <tr><td><code>proxy unset</code></td><td>清除代理配置</td></tr>
+  <tr><td><code>proxy test [--url URL]</code></td><td>通过 curl 测试代理连通性</td></tr>
+  <tr><td><code>proxy check</code></td><td>全面诊断：代理、curl、api.openai.com、npm、codex</td></tr>
+  <tr><td><code>run &lt;args...&gt;</code></td><td>注入代理环境变量并运行 codex</td></tr>
+</table>
+
+<hr>
+
+<!-- ============================================================ -->
+<h2>模式二：链式中转</h2>
+
+<h3><span class="tag tag-server">中间服务器</span> 部署中转服务</h3>
+
+<ol class="steps">
+  <li>
+    <strong>安装 codex-relay</strong>
+    <pre><span class="cmd">./codex-relay install</span></pre>
+  </li>
+  <li>
+    <strong>生成访问 token</strong>
+    <pre><span class="cmd">codex-relay chain token generate</span>
+<span class="out">AbCdEf1234567890...</span>  <span class="c">← 复制此 token，仅输出一次</span></pre>
+    Token 以 SHA-256 hash 形式保存在配置文件中，不会明文存储。
+  </li>
+  <li>
+    <strong>保存中转配置</strong>
+    <pre><span class="c"># 基础配置：多个上游按顺序 fallback，direct 表示直连目标</span>
+<span class="cmd">codex-relay chain config</span> \
+  <span class="val">--listen</span> 0.0.0.0:8080 \
+  <span class="val">--upstream</span> http://user:pass@static-proxy:8080,direct
+
+<span class="c"># 可选：启用 TLS</span>
+<span class="cmd">codex-relay chain config</span> \
+  <span class="val">--listen</span> 0.0.0.0:8443 \
+  <span class="val">--upstream</span> http://user:pass@static-proxy:8080,direct \
+  <span class="val">--tls-cert</span> /etc/codex-relay/fullchain.pem \
+  <span class="val">--tls-key</span> /etc/codex-relay/privkey.pem</pre>
+  </li>
+  <li>
+    <strong>启动中转服务</strong>
+    <pre><span class="cmd">codex-relay chain start</span>
+<span class="cmd">codex-relay chain status</span>
+<span class="out">chain relay:    running (pid 12345)</span></pre>
+  </li>
+</ol>
+
+<h3><span class="tag tag-client">本机</span> 配置客户端</h3>
+
+<ol class="steps">
+  <li>
+    <strong>安装 codex-relay</strong>（如未安装）
+    <pre><span class="cmd">./codex-relay install</span></pre>
+  </li>
+  <li>
+    <strong>配置代理指向中间服务器</strong>
+    <pre><span class="c"># token 放在 URL 的 user 部分，以 Proxy-Authorization 传递</span>
+<span class="cmd">codex-relay proxy set</span> <span class="val">http://&lt;TOKEN&gt;@relay.example.com:8080</span>
+
+<span class="c"># 如果中间服务器启用了 TLS</span>
+<span class="cmd">codex-relay proxy set</span> <span class="val">https://&lt;TOKEN&gt;@relay.example.com:8443</span></pre>
+  </li>
+  <li>
+    <strong>验证连通性</strong>
+    <pre><span class="cmd">codex-relay proxy test</span></pre>
+  </li>
+  <li>
+    <strong>运行 codex</strong>
+    <pre><span class="cmd">codex-relay run</span></pre>
+  </li>
+</ol>
+
+<h3>中转服务器管理命令</h3>
+
+<table>
+  <tr><th>命令</th><th>用途</th></tr>
+  <tr><td><code>chain config --listen --upstream</code></td><td>保存中转配置</td></tr>
+  <tr><td><code>chain token generate</code></td><td>生成 token，hash 写入配置</td></tr>
+  <tr><td><code>chain token show / unset</code></td><td>查看 / 清除 token</td></tr>
+  <tr><td><code>chain start / stop / restart</code></td><td>管理后台守护进程</td></tr>
+  <tr><td><code>chain status</code></td><td>查看守护进程状态和心跳</td></tr>
+  <tr><td><code>chain logs</code></td><td>查看请求日志</td></tr>
+  <tr><td><code>chain serve --listen --upstream [--token]</code></td><td>前台运行（调试用）</td></tr>
+</table>
+
+<hr>
+
+<!-- ============================================================ -->
+<h2>请求链路</h2>
+
+<h3>直连模式</h3>
+<div class="arch"><span class="c"># codex-relay run 设置环境变量</span>
+<span class="out">HTTP_PROXY</span>=http://proxy:8080
+
+<span class="c"># codex 发出请求</span>
+<span class="node">codex</span> <span class="arrow">──CONNECT api.openai.com:443──</span> <span class="node">静态代理</span> <span class="arrow">──TLS 隧道──</span> <span class="target">OpenAI</span></div>
+
+<h3>链式中转模式</h3>
+<div class="arch"><span class="c"># codex-relay run 设置环境变量</span>
+<span class="out">HTTP_PROXY</span>=http://token@relay:8080
+
+<span class="c"># 请求流程</span>
+<span class="node">codex</span> <span class="arrow">──CONNECT api.openai.com:443──</span> <span class="node">chain relay</span>
+       Proxy-Authorization: Basic &lt;token&gt;
+
+<span class="node">chain relay</span> <span class="arrow">──CONNECT api.openai.com:443──</span> <span class="node">静态代理</span>
+       Proxy-Authorization: Basic &lt;upstream-auth&gt;
+
+<span class="node">静态代理</span> <span class="arrow">──TLS 隧道──</span> <span class="target">OpenAI</span></div>
+
+<p class="muted">链式中转服务器不修改请求目标、不做 DNS 解析、不做 TLS 解密。仅做 token 校验和认证 header 替换。</p>
+
+<hr>
+
+<!-- ============================================================ -->
+<h2>诊断</h2>
+
+<pre><span class="c"># 全面诊断（推荐首次配置后执行）</span>
+<span class="cmd">codex-relay proxy check</span>
+
+<span class="out">  ✓ proxy config (http://user:pass@host:47453)
+  ✓ curl (available)
+  ✓ api.openai.com reachable (HTTP 421)
+  ✓ npm (available)
+  ✓ codex CLI (codex-cli 0.133.0)
+
+5 OK, 0 issues</span></pre>
+
+<pre><span class="c"># 手动验证代理</span>
+<span class="cmd">curl -v --proxy http://user:pass@host:8080 https://api.openai.com -o /dev/null</span>
+
+<span class="c"># 查看链式中转日志</span>
+<span class="cmd">codex-relay chain logs</span></pre>
+
+<hr>
+
+<!-- ============================================================ -->
+<h2>配置文件</h2>
+
+<pre>~/.codex-relay/
+├── <span class="node">config.json</span>          <span class="c"># 代理配置 &amp; 链式中转配置</span>
+├── chain.pid            <span class="c"># 链式中转 PID</span>
+├── chain.log            <span class="c"># 链式中转请求日志</span>
+└── chain.heartbeat      <span class="c"># 链式中转心跳</span></pre>
+
+<hr>
+
+<!-- ============================================================ -->
+<h2>环境变量</h2>
+
+<p><code>run</code> 命令自动注入以下环境变量到 codex 进程：</p>
+
+<table>
+  <tr><th>变量</th><th>值</th></tr>
+  <tr><td><code>HTTP_PROXY</code></td><td>配置的代理 URL</td></tr>
+  <tr><td><code>HTTPS_PROXY</code></td><td>配置的代理 URL</td></tr>
+  <tr><td><code>WS_PROXY</code></td><td>配置的代理 URL</td></tr>
+  <tr><td><code>WSS_PROXY</code></td><td>配置的代理 URL</td></tr>
+  <tr><td><code>NO_PROXY</code></td><td><code>localhost,127.0.0.1,::1,.local</code></td></tr>
+</table>
+
+<p class="muted">代理优先级：<code>HTTP_PROXY</code> 环境变量 &gt; <code>proxy set</code> 配置。</p>
+
+<footer>
+  codex-relay &mdash; Node.js &ge; 18 &middot; 零 npm 依赖 &middot; macOS / Linux
+</footer>
+
+</div>
+</body>
+</html>

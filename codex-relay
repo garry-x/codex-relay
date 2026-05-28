@@ -4,7 +4,6 @@
 
 const net = require("net");
 const tls = require("tls");
-const dns = require("dns").promises;
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -33,19 +32,10 @@ const REAL_HOME = (() => {
 })();
 const CONFIG_DIR = path.join(REAL_HOME, ".codex-relay");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
-const DNS_CACHE_FILE = path.join(CONFIG_DIR, "dns.json");
-const PID_FILE = path.join(CONFIG_DIR, "proxy.pid");
-const PORT_FILE = path.join(CONFIG_DIR, "proxy.port");
-const BYPASS_PID_FILE = path.join(CONFIG_DIR, "bypass.pid");
 const CHAIN_PID_FILE = path.join(CONFIG_DIR, "chain.pid");
 const CHAIN_HEARTBEAT_FILE = path.join(CONFIG_DIR, "chain.heartbeat");
-const LOG_FILE = path.join(CONFIG_DIR, "proxy.log");
 const CHAIN_LOG_FILE = path.join(CONFIG_DIR, "chain.log");
 const MAX_LOG_LINES = 500;
-
-function proxyLog(msg) {
-  appendLog(LOG_FILE, msg);
-}
 
 function chainLog(msg) {
   appendLog(CHAIN_LOG_FILE, msg);
@@ -68,18 +58,6 @@ function appendLog(file, msg) {
 const SCRIPT_PATH = (() => {
   try { return fs.realpathSync(process.argv[1]); } catch { return process.argv[1]; }
 })();
-
-const BYPASS_HOSTS = [
-  { host: "chatgpt.com", alias: "127.0.0.1" },
-];
-
-const OPENAI_DOMAINS = [
-  "api.openai.com",
-  "auth.openai.com",
-  "chatgpt.com",
-  "platform.openai.com",
-  "developers.openai.com",
-];
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -117,127 +95,6 @@ function codexVersion() {
   const bin = findCodex();
   if (!bin) return null;
   try { return execSync(`"${bin}" --version`, { encoding: "utf8", timeout: 5000 }).trim(); } catch { return null; }
-}
-
-// ── DNS resolution ─────────────────────────────────────────────────────────
-
-async function resolveAllIPs(host) {
-  try { return await dns.resolve4(host); } catch { return []; }
-}
-
-// In-memory cache to reduce disk I/O on every CONNECT
-let _dnsMemCache = null;
-let _dnsMemCacheTs = 0;
-const DNS_MEM_CACHE_TTL = 30000; // 30 seconds before re-reading from disk
-
-function loadDnsCache() {
-  const now = Date.now();
-  if (_dnsMemCache && (now - _dnsMemCacheTs) < DNS_MEM_CACHE_TTL) return _dnsMemCache;
-  try {
-    const raw = JSON.parse(fs.readFileSync(DNS_CACHE_FILE, "utf8"));
-    for (const [host, entry] of Object.entries(raw)) {
-      if (entry.ip && !entry.ips) {
-        raw[host] = { ips: [{ ip: entry.ip, ok: null, testedAt: null }], ts: entry.ts || 0 };
-      }
-    }
-    _dnsMemCache = raw;
-    _dnsMemCacheTs = now;
-    return raw;
-  } catch { return {}; }
-}
-function saveDnsCache(cache) {
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.writeFileSync(DNS_CACHE_FILE, JSON.stringify(cache, null, 2));
-  _dnsMemCache = cache;
-  _dnsMemCacheTs = Date.now();
-}
-
-function getBestIp(host) {
-  const cache = loadDnsCache();
-  const entry = cache[host];
-  if (!entry || !entry.ips?.length) return null;
-  // Priority: ok:true > ok:null (untested) > skip ok:false
-  const good = entry.ips.filter((e) => e.ok === true);
-  const untested = entry.ips.filter((e) => e.ok === null || e.ok === undefined);
-  const pool = good.length > 0 ? good : untested.length > 0 ? untested : entry.ips;
-  // Random within same priority tier
-  return pool[Math.floor(Math.random() * pool.length)]?.ip || null;
-}
-
-function markIpResult(host, ip, ok) {
-  const cache = loadDnsCache();
-  const entry = cache[host];
-  if (!entry || !entry.ips) return;
-  for (const e of entry.ips) {
-    if (e.ip === ip) { e.ok = ok; e.testedAt = Date.now(); break; }
-  }
-  // If none matched, add it
-  if (!entry.ips.some((e) => e.ip === ip)) {
-    entry.ips.push({ ip, ok, testedAt: Date.now() });
-  }
-  saveDnsCache(cache);
-}
-
-function upsertCacheIPs(host, ips) {
-  const cache = loadDnsCache();
-  const entry = cache[host] || { ips: [], ts: 0 };
-  const existing = new Map(entry.ips.map((e) => [e.ip, e]));
-  entry.ips = ips.map((ip) => {
-    const old = existing.get(ip);
-    return old || { ip, ok: null, testedAt: null };
-  });
-  entry.ts = Date.now();
-  cache[host] = entry;
-  saveDnsCache(cache);
-}
-
-// Test one IP through the upstream proxy by checking CONNECT response
-async function testIp(ip, host, port, upstreamUrl) {
-  const { auth } = parseProxyUrl(upstreamUrl);
-  return new Promise((resolve) => {
-    const sock = connectProxySocket(upstreamUrl, () => {
-      let req = `CONNECT ${ip}:${port || 443} HTTP/1.1\r\nHost: ${host}:${port || 443}\r\n`;
-      if (auth) req += `Proxy-Authorization: Basic ${auth}\r\n`;
-      req += "\r\n";
-      sock.write(req);
-      sock.once("data", (data) => {
-        const ok = data.toString().startsWith("HTTP/1.1 200") || data.toString().startsWith("HTTP/1.0 200");
-        sock.destroy();
-        resolve(ok);
-      });
-    });
-    sock.setTimeout(3000);
-    sock.on("error", () => resolve(false));
-    sock.on("timeout", () => { sock.destroy(); resolve(false); });
-  });
-}
-
-async function refreshDnsCache(domains = OPENAI_DOMAINS, proxyUrl, logCb) {
-  const log = logCb || ((...a) => console.log(...a));
-  if (!proxyUrl) {
-    const cfg = loadConfig();
-    proxyUrl = cfg.https || cfg.http;
-  }
-  for (const host of domains) {
-    const ips = await resolveAllIPs(host);
-    if (ips.length > 0) {
-      upsertCacheIPs(host, ips);
-      if (proxyUrl) {
-        const results = [];
-        for (const ip of ips) {
-          const ok = await testIp(ip, host, 443, proxyUrl);
-          results.push(ok ? "✓" : "✗");
-          markIpResult(host, ip, ok);
-        }
-        log(`  ${host.padEnd(30)} → ${ips.join(", ")}  [${results.join(" ")}]`);
-      } else {
-        log(`  ${host.padEnd(30)} → ${ips.join(", ")}  (no proxy to test)`);
-      }
-    } else {
-      log(`  ${host.padEnd(30)} → FAILED`);
-    }
-  }
-  return loadDnsCache();
 }
 
 // Parse proxy URL: http://[user:pass@]host:port
@@ -317,201 +174,6 @@ function proxyAuthToken(headStr) {
   }
 }
 
-// ── local forward proxy ────────────────────────────────────────────────────
-
-function startLocalProxy(upstreamUrl, port = 0) {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.on("error", reject);
-
-    server.listen(port, "127.0.0.1", () => {
-      // Replace startup-only error handler with persistent one
-      server.removeListener("error", reject);
-      server.on("error", (e) => {
-        proxyLog(`server error: ${e.message}`);
-      });
-      const addr = server.address();
-      resolve({ server, port: addr.port });
-    });
-
-    server.on("connection", (clientSocket) => {
-      clientSocket.once("data", (head) => {
-        handleRequest(clientSocket, head, upstreamUrl);
-      });
-      clientSocket.on("error", () => {}); // prevent crash on client errors
-    });
-  });
-}
-
-async function handleRequest(clientSocket, head, upstreamUrl) {
-  try {
-    const headStr = head.toString();
-    const connectMatch = headStr.match(/^CONNECT (.+):(\d+)/m);
-
-    if (!connectMatch) {
-      forwardHttp(clientSocket, head, upstreamUrl);
-      return;
-    }
-
-    const host = connectMatch[1];
-    const port = parseInt(connectMatch[2], 10);
-
-        // Resolve all IPs and cache if not already cached
-        let entry = loadDnsCache()[host];
-        if (!entry || !entry.ips?.length) {
-          const ips = await resolveAllIPs(host);
-          if (ips.length > 0) { upsertCacheIPs(host, ips); entry = loadDnsCache()[host]; }
-        }
-
-        // Parse proxy URL: http(s)://[user:pass@]host:port
-        const { auth } = parseProxyUrl(upstreamUrl);
-
-        // Try up to 3 IPs
-        const triedIps = [];
-        let connected = false;
-        const MAX_TRIES = 2; // 2 attempts; WebSocket has tight timeouts
-
-        for (let attempt = 0; attempt < MAX_TRIES && !connected; attempt++) {
-          const ip = getBestIp(host);
-          if (!ip) break;
-          if (triedIps.includes(ip)) break;
-          triedIps.push(ip);
-
-          const target = ip || host;
-          let modified = headStr.replace(
-            /^CONNECT .+:\d+/m,
-            `CONNECT ${target}:${port}`
-          );
-          modified = addInternalHostHeader(modified, host);
-          if (auth) modified = addProxyAuthorization(modified, auth);
-
-          await new Promise((resolve) => {
-            let upstreamSocket;
-            // TCP connect timeout: 3s to reach upstream proxy
-            const connTimer = setTimeout(() => {
-              markIpResult(host, ip, false);
-              proxyLog(`CONNECT ${host}:${port} → ${ip} connect timeout`);
-              try { upstreamSocket.destroy(); } catch {}
-              resolve(); // try next IP
-            }, 3000);
-            upstreamSocket = connectProxySocket(upstreamUrl, () => {
-              clearTimeout(connTimer);
-              // Response timeout: 3s for upstream to reply to CONNECT
-              upstreamSocket.setTimeout(3000);
-              upstreamSocket.on("timeout", () => {
-                markIpResult(host, ip, false);
-                proxyLog(`CONNECT ${host}:${port} → ${ip} response timeout`);
-                try { clientSocket.write("HTTP/1.1 504 Gateway Timeout\r\n\r\n"); clientSocket.end(); } catch {}
-                try { upstreamSocket.destroy(); } catch {}
-                connected = true;
-                resolve();
-              });
-              upstreamSocket.write(modified);
-              // Buffer entire upstream HTTP response to avoid TLS stream corruption
-              let respBuf = Buffer.alloc(0);
-              const onData = (chunk) => {
-                respBuf = Buffer.concat([respBuf, chunk]);
-                const headerEnd = respBuf.indexOf("\r\n\r\n");
-                if (headerEnd < 0) return; // need more data
-                upstreamSocket.removeListener("data", onData);
-
-                const respStr = respBuf.toString("utf8", 0, headerEnd + 4);
-                if (respStr.startsWith("HTTP/1.1 200") || respStr.startsWith("HTTP/1.0 200")) {
-                  markIpResult(host, ip, true);
-                  proxyLog(`CONNECT ${host}:${port} → ${ip} OK`);
-                  upstreamSocket.setTimeout(0);
-                  upstreamSocket.removeAllListeners("timeout");
-                  // TCP keepalive to prevent upstream proxy idle timeout
-                  upstreamSocket.setKeepAlive(true, 30000);
-                  clientSocket.setKeepAlive(true, 30000);
-                  clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-                  const leftover = respBuf.slice(headerEnd + 4);
-                  if (leftover.length > 0) clientSocket.write(leftover);
-                  clientSocket.pipe(upstreamSocket);
-                  upstreamSocket.pipe(clientSocket);
-                  connected = true;
-                } else {
-                  markIpResult(host, ip, false);
-                  proxyLog(`CONNECT ${host}:${port} → ${ip} rejected: ${respStr.split("\r\n")[0]}`);
-                  try { clientSocket.write(respStr); } catch {}
-                  upstreamSocket.destroy();
-                }
-                resolve();
-              };
-              upstreamSocket.on("data", onData);
-            });
-            upstreamSocket.on("error", () => {
-              if (connected) return;
-              clearTimeout(connTimer);
-              markIpResult(host, ip, false);
-              try { upstreamSocket.destroy(); } catch {}
-              resolve(); // try next IP
-            });
-            clientSocket.on("error", () => {
-              clearTimeout(connTimer);
-              try { upstreamSocket.destroy(); } catch {}
-              resolve();
-            });
-          });
-        }
-
-        if (!connected) {
-          proxyLog(`CONNECT ${host}:${port} FAIL all IPs tried: ${triedIps.join(", ")}`);
-          try { clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"); clientSocket.end(); } catch {}
-        }
-  } catch (e) {
-    proxyLog(`request error: ${e.message}`);
-    try { clientSocket.end(); } catch {}
-  }
-}
-
-async function forwardHttp(clientSocket, head, upstreamUrl) {
-  const headStr = head.toString();
-
-  // Parse target host from HTTP request line: GET http://host/path HTTP/1.1
-  const reqMatch = headStr.match(/^([A-Z]+) http:\/\/([^/:]+)(:\d+)?(\/[^\s]*)? HTTP\/[0-9.]+\r\n/m);
-  let modifiedHead = headStr;
-
-  if (reqMatch) {
-    const host = reqMatch[2];
-    let ip = getBestIp(host);
-    if (!ip) {
-      const ips = await resolveAllIPs(host);
-      if (ips.length > 0) { upsertCacheIPs(host, ips); ip = getBestIp(host); }
-    }
-    if (ip) {
-      // Rewrite request URL to use IP so upstream proxy doesn't need DNS
-      const portSuffix = reqMatch[3] || "";
-      const path = reqMatch[4] || "/";
-      modifiedHead = headStr.replace(
-        `http://${host}${portSuffix}${path}`,
-        `http://${ip}${portSuffix}${path}`
-      );
-    }
-    modifiedHead = addInternalHostHeader(modifiedHead, host);
-  }
-
-  const { auth } = parseProxyUrl(upstreamUrl);
-
-  // Inject Proxy-Authorization if upstream needs it and request lacks it
-  if (auth) modifiedHead = addProxyAuthorization(modifiedHead, auth);
-
-  const upstream = connectProxySocket(upstreamUrl, () => {
-    upstream.setKeepAlive(true, 30000);
-    clientSocket.setKeepAlive(true, 30000);
-    upstream.write(modifiedHead);
-    clientSocket.pipe(upstream);
-    upstream.pipe(clientSocket);
-  });
-  upstream.setTimeout(10000);
-  upstream.on("timeout", () => {
-    try { clientSocket.end(); } catch {}
-    try { upstream.destroy(); } catch {}
-  });
-  upstream.on("error", () => { try { clientSocket.end(); } catch {} });
-  clientSocket.on("error", () => { try { upstream.end(); } catch {} });
-}
-
 function chainUpstreams(input) {
   if (Array.isArray(input)) return input.filter(Boolean);
   return String(input || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -535,73 +197,13 @@ function connectTargetFromHead(headStr) {
   };
 }
 
-function ipv4ToInt(ip) {
-  const parts = ip.split(".").map((p) => parseInt(p, 10));
-  if (parts.length !== 4 || parts.some((p) => Number.isNaN(p) || p < 0 || p > 255)) return null;
-  return (((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3]) >>> 0;
-}
-
-function cidrContains(cidr, ip) {
-  const [base, bitsStr] = cidr.split("/");
-  const bits = parseInt(bitsStr, 10);
-  const baseInt = ipv4ToInt(base);
-  const ipInt = ipv4ToInt(ip);
-  if (baseInt === null || ipInt === null || Number.isNaN(bits) || bits < 0 || bits > 32) return false;
-  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
-  return (baseInt & mask) === (ipInt & mask);
-}
-
-function isIpv4(host) {
-  return ipv4ToInt(host) !== null;
-}
-
-function allowedChainTarget(headStr, allowList) {
-  if (!allowList || allowList.length === 0) return true;
-  const originalHost = internalHost(headStr);
-  const target = connectTargetFromHead(headStr);
-  const candidates = [originalHost, target?.host].filter(Boolean);
-  return candidates.some((host) => allowList.some((allow) => {
-    if (allow === "*") return true;
-    if (allow.includes("/")) return cidrContains(allow, host);
-    if (allow.startsWith(".")) return host.endsWith(allow);
-    return host === allow;
-  }));
-}
-
-async function prepareChainTarget(headStr, target, reqId) {
+function prepareChainTarget(headStr, target, reqId) {
   const originalHost = internalHost(headStr) || target.host;
-  let resolvedHost = target.host;
-  let nextHead = addInternalHostHeader(headStr, originalHost);
-
-  if (target.host && !isIpv4(target.host)) {
-    let ip = getBestIp(target.host);
-    if (!ip) {
-      const ips = await resolveAllIPs(target.host);
-      if (ips.length > 0) {
-        upsertCacheIPs(target.host, ips);
-        ip = getBestIp(target.host);
-      }
-    }
-    if (ip) {
-      resolvedHost = ip;
-      chainLog(`${reqId} resolve ${target.host} -> ${ip}`);
-      if (target.mode === "connect") {
-        nextHead = nextHead.replace(/^CONNECT .+:\d+/m, `CONNECT ${ip}:${target.port}`);
-      } else {
-        const portSuffix = target.port && target.port !== 80 ? `:${target.port}` : "";
-        nextHead = nextHead.replace(
-          `http://${target.host}${portSuffix}${target.path}`,
-          `http://${ip}${portSuffix}${target.path}`
-        );
-      }
-    } else {
-      chainLog(`${reqId} resolve ${target.host} failed; forwarding hostname`);
-    }
-  }
-
+  const nextHead = addInternalHostHeader(headStr, originalHost);
+  chainLog(`${reqId} ${target.mode.toUpperCase()} ${originalHost}:${target.port}`);
   return {
     headStr: nextHead,
-    target: { ...target, host: resolvedHost, originalHost },
+    target: { ...target, originalHost },
   };
 }
 
@@ -693,7 +295,7 @@ function tryChainUpstream(clientSocket, headStr, upstreamUrl, target, reqId, tim
   });
 }
 
-function startChainRelay({ listen, upstreamUrl, upstreams, token, tokenHash, allow = [], tlsCert, tlsKey }) {
+function startChainRelay({ listen, upstreamUrl, upstreams, token, tokenHash, tlsCert, tlsKey }) {
   const { host: listenHost, port: listenPort } = parseListenAddr(listen);
   const upstreamList = chainUpstreams(upstreams || upstreamUrl);
   if (upstreamList.length === 0) die("chain relay requires at least one upstream or direct");
@@ -712,13 +314,6 @@ function startChainRelay({ listen, upstreamUrl, upstreams, token, tokenHash, all
         chainLog(`${reqId} auth failed`);
         return;
       }
-      if (!allowedChainTarget(headStr, allow)) {
-        const target = connectTargetFromHead(headStr);
-        chainLog(`${reqId} ACL denied: ${internalHost(headStr) || target?.host || "unknown"}`);
-        try { clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\n"); clientSocket.end(); } catch {}
-        return;
-      }
-
       const target = connectTargetFromHead(headStr);
       if (!target) {
         chainLog(`${reqId} bad request`);
@@ -726,7 +321,7 @@ function startChainRelay({ listen, upstreamUrl, upstreams, token, tokenHash, all
         return;
       }
 
-      const prepared = await prepareChainTarget(headStr, target, reqId);
+      const prepared = prepareChainTarget(headStr, target, reqId);
       const preparedHead = prepared.headStr;
       const preparedTarget = prepared.target;
 
@@ -749,21 +344,10 @@ function startChainRelay({ listen, upstreamUrl, upstreams, token, tokenHash, all
     chainLog(`chain relay listening on ${listenHost}:${listenPort}`);
     info(`chain relay listening on ${listenHost}:${listenPort}${tlsCert ? " (TLS)" : ""}`);
     info(`upstreams: ${upstreamList.map(redactProxyUrl).join(", ")}`);
-    if (allow.length > 0) info(`ACL: ${allow.join(", ")}`);
     if (token || tokenHash) info("client auth: enabled");
     else info("client auth: disabled");
   });
   return server;
-}
-
-function isProxyRunning() {
-  try {
-    const pid = parseInt(fs.readFileSync(PID_FILE, "utf8").trim(), 10);
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 // ── CLI handlers ───────────────────────────────────────────────────────────
@@ -780,26 +364,11 @@ function cmdProxySet(url) {
 function cmdProxyShow() {
   const cfg = loadConfig();
 
-  // Upstream proxy config
   if (process.env.HTTP_PROXY) console.log(`env proxy:       ${process.env.HTTP_PROXY}`);
   else if (process.env.http_proxy) console.log(`env proxy:       ${process.env.http_proxy}`);
   if (cfg.http) console.log(`config proxy:    ${cfg.http}`);
-  if (cfg.provider_url) console.log(`provider URL:    ${cfg.provider_url}`);
-
-  // Local forward proxy daemon status
-  if (isProxyRunning()) {
-    const port = fs.readFileSync(PORT_FILE, "utf8").trim();
-    console.log(`local daemon:    running on 127.0.0.1:${port}`);
-  } else {
-    console.log(`local daemon:    stopped`);
-  }
-
-  // Effective proxy for codex sessions
-  const localPort = getLocalProxyPort();
-  if (localPort) {
-    console.log(`effective proxy: http://127.0.0.1:${localPort} (local daemon)`);
-  } else if (cfg.http || process.env.HTTP_PROXY || process.env.http_proxy) {
-    console.log(`effective proxy: ${cfg.http || process.env.HTTP_PROXY || process.env.http_proxy} (direct)`);
+  if (cfg.http || process.env.HTTP_PROXY || process.env.http_proxy) {
+    console.log(`effective proxy: ${cfg.http || process.env.HTTP_PROXY || process.env.http_proxy}`);
   } else {
     console.log(`effective proxy: none`);
   }
@@ -810,289 +379,8 @@ function cmdProxyUnset() {
   const cfg = loadConfig();
   delete cfg.http;
   delete cfg.https;
-  delete cfg.provider_url;
   saveConfig(cfg);
   info("proxy configuration cleared.");
-}
-
-function cmdProxyStart() {
-  const cfg = loadConfig();
-  const upstreamUrl = cfg.https || cfg.http;
-  if (!upstreamUrl) die("no upstream proxy configured. Set one first: codex-relay proxy set <url>");
-
-  if (isProxyRunning()) {
-    const port = fs.readFileSync(PORT_FILE, "utf8").trim();
-    info(`local proxy already running on 127.0.0.1:${port}`);
-  } else {
-    // Launch daemon process
-    const child = spawn(
-      process.execPath,
-      [SCRIPT_PATH, "--_daemon", upstreamUrl],
-      { detached: true, stdio: "ignore" }
-    );
-    child.unref();
-
-    for (let i = 0; i < 20; i++) {
-      if (isProxyRunning()) break;
-      execSync("sleep 0.1", { stdio: "ignore" });
-    }
-
-    if (!isProxyRunning()) die("failed to start local proxy daemon");
-    const port = fs.readFileSync(PORT_FILE, "utf8").trim();
-    info(`local proxy started on 127.0.0.1:${port}`);
-    info(`HTTP_PROXY=http://127.0.0.1:${port} is active for codex sessions`);
-  }
-
-  // Bypass is off by default since apps feature is disabled
-  // Run `codex-relay proxy bypass` to enable if needed (requires sudo)
-}
-
-function runProxyDaemon(upstreamUrl) {
-  process.title = "codex-relay-proxy";
-  proxyLog("daemon started, pid=" + process.pid);
-
-  // Prevent SIGHUP from killing daemon when terminal closes
-  process.on("SIGHUP", () => {
-    proxyLog("received SIGHUP — ignoring");
-  });
-  process.on("SIGPIPE", () => {
-    proxyLog("received SIGPIPE — ignoring");
-  });
-
-  process.on("beforeExit", (code) => {
-    clearInterval(hbInterval);
-    proxyLog(`daemon exiting, code=${code}`);
-    cleanupProxyFiles();
-  });
-
-  process.on("unhandledRejection", (e) => {
-    proxyLog(`unhandled rejection: ${e?.message || e}`);
-  });
-  process.on("uncaughtException", (e) => {
-    proxyLog(`CRASH: ${e.message}`);
-    process.exit(1);
-  });
-
-  // Heartbeat every 60s to confirm daemon is alive
-  const hbInterval = setInterval(() => {
-    try { fs.writeFileSync(path.join(CONFIG_DIR, "proxy.heartbeat"), String(Date.now())); } catch {}
-  }, 60000);
-
-  const REFRESH_INTERVAL = 5 * 60 * 1000; // 5 minutes
-
-  async function refreshDnsLoop() {
-    while (true) {
-      await new Promise((r) => setTimeout(r, REFRESH_INTERVAL));
-      try {
-        // Refresh: resolve all IPs and test connectivity
-        await refreshDnsCache(OPENAI_DOMAINS, upstreamUrl, (msg) => proxyLog(msg));
-      } catch {} // silent — proxy still works with stale cache
-    }
-  }
-
-  startLocalProxy(upstreamUrl).then(({ server, port }) => {
-    fs.writeFileSync(PID_FILE, String(process.pid));
-    fs.writeFileSync(PORT_FILE, String(port));
-
-    // Detach from terminal
-    try { process.stdin.destroy(); } catch {}
-    try { process.stdout.destroy(); } catch {}
-    try { process.stderr.destroy(); } catch {}
-    try { fs.closeSync(0); } catch {}
-    try { fs.closeSync(1); } catch {}
-    try { fs.closeSync(2); } catch {}
-
-    // Periodic DNS refresh
-    refreshDnsLoop();
-
-    const cleanup = () => {
-      proxyLog("daemon shutting down on signal");
-      clearInterval(hbInterval);
-      server.close();
-      cleanupProxyFiles();
-      process.exit(0);
-    };
-    process.on("SIGTERM", cleanup);
-    process.on("SIGINT", cleanup);
-  }).catch(() => process.exit(1));
-}
-
-function cmdProxyStop() {
-  if (!isProxyRunning()) {
-    info("no proxy daemon running.");
-    return;
-  }
-
-  if (isProxyRunning()) {
-    const pid = parseInt(fs.readFileSync(PID_FILE, "utf8").trim(), 10);
-    try { process.kill(pid, "SIGTERM"); } catch {}
-    cleanupProxyFiles();
-    info("local proxy stopped.");
-  }
-}
-
-function cleanupProxyFiles() {
-  try { fs.unlinkSync(PID_FILE); } catch {}
-  try { fs.unlinkSync(PORT_FILE); } catch {}
-}
-
-function isBypassRunning() {
-  try {
-    const pid = parseInt(fs.readFileSync(BYPASS_PID_FILE, "utf8").trim(), 10);
-    try { process.kill(pid, 0); return true; } catch {}
-    // Root-owned process — check via ps
-    const out = execSync(`ps -p ${pid} -o comm= 2>/dev/null`, { encoding: "utf8", timeout: 2000 }).trim();
-    return out.includes("codex-relay-bypass");
-  } catch {
-    return false;
-  }
-}
-
-function runBypassDaemon(proxyPort) {
-  process.title = "codex-relay-bypass";
-  proxyLog("bypass daemon started, pid=" + process.pid + ", target=127.0.0.1:" + proxyPort);
-
-  process.on("SIGHUP", () => {});
-  process.on("beforeExit", (code) => {
-    proxyLog(`bypass daemon exiting, code=${code}`);
-    try { fs.unlinkSync(BYPASS_PID_FILE); } catch {}
-  });
-
-  process.on("unhandledRejection", (e) => {
-    proxyLog(`bypass unhandled rejection: ${e?.message || e}`);
-  });
-  process.on("uncaughtException", (e) => {
-    proxyLog(`bypass CRASH: ${e.message}`);
-    try { fs.unlinkSync(BYPASS_PID_FILE); } catch {}
-    process.exit(1);
-  });
-
-  const server = net.createServer((clientSocket) => {
-    const upstream = new net.Socket();
-    upstream.connect(proxyPort, "127.0.0.1", () => {
-      upstream.setKeepAlive(true, 30000);
-      clientSocket.setKeepAlive(true, 30000);
-      clientSocket.pipe(upstream);
-      upstream.pipe(clientSocket);
-    });
-    upstream.on("error", () => { try { clientSocket.end(); } catch {} });
-    clientSocket.on("error", () => { try { upstream.end(); } catch {} });
-  });
-
-  server.on("error", (e) => {
-    proxyLog(`bypass server error: ${e.message}`);
-    process.exit(1);
-  });
-  server.listen(443, "127.0.0.1", () => {
-    fs.writeFileSync(BYPASS_PID_FILE, String(process.pid));
-
-    try { process.stdin.destroy(); } catch {}
-    try { process.stdout.destroy(); } catch {}
-    try { process.stderr.destroy(); } catch {}
-    try { fs.closeSync(0); } catch {}
-    try { fs.closeSync(1); } catch {}
-    try { fs.closeSync(2); } catch {}
-
-    // Heartbeat every 60s
-    const hbInterval = setInterval(() => {
-      try { fs.writeFileSync(path.join(CONFIG_DIR, "bypass.heartbeat"), String(Date.now())); } catch {}
-    }, 60000);
-
-    const cleanup = () => {
-      proxyLog("bypass daemon shutting down on signal");
-      clearInterval(hbInterval);
-      server.close();
-      try { fs.unlinkSync(BYPASS_PID_FILE); } catch {}
-      try { fs.unlinkSync(path.join(CONFIG_DIR, "bypass.heartbeat")); } catch {}
-      process.exit(0);
-    };
-    process.on("SIGTERM", cleanup);
-    process.on("SIGINT", cleanup);
-  });
-}
-
-function cleanupBypassFiles() {
-  try { fs.unlinkSync(BYPASS_PID_FILE); } catch {}
-  try { fs.unlinkSync(path.join(CONFIG_DIR, "bypass.heartbeat")); } catch {}
-}
-
-function manageHosts(action) {
-  const hostsFile = "/etc/hosts";
-  const marker = "# codex-relay-bypass";
-  let content;
-  try {
-    content = fs.readFileSync(hostsFile, "utf8");
-  } catch {
-    die(`cannot read ${hostsFile}`);
-  }
-
-  const lines = content.split("\n").filter((l) => !l.includes(marker));
-  if (action === "add") {
-    for (const entry of BYPASS_HOSTS) {
-      lines.push(`${entry.alias} ${entry.host} ${marker}`);
-    }
-  }
-  try {
-    fs.writeFileSync(hostsFile, lines.join("\n") + "\n");
-  } catch {
-    die(`cannot write ${hostsFile}. Run with sudo.`);
-  }
-}
-
-function cmdProxyBypass(opts = {}) {
-  if (opts.remove) {
-    if (!isBypassRunning()) {
-      info("bypass not running.");
-    } else {
-      const pid = parseInt(fs.readFileSync(BYPASS_PID_FILE, "utf8").trim(), 10);
-      try { process.kill(pid, "SIGTERM"); } catch {}
-      cleanupBypassFiles();
-      info("bypass stopped.");
-    }
-    manageHosts("remove");
-    info("hosts entries removed.");
-    return;
-  }
-
-  if (isBypassRunning()) {
-    info("bypass already running.");
-    return;
-  }
-
-  const localPort = getLocalProxyPort();
-  if (!localPort) die("local proxy not running. Start it first: codex-relay proxy start");
-
-  // 1. Add hosts entries
-  manageHosts("add");
-  info("hosts: chatgpt.com → 127.0.0.1");
-
-  // 2. Launch bypass daemon (needs sudo for port 443)
-  const child = spawn(
-    process.execPath,
-    [SCRIPT_PATH, "--_bypass-daemon", String(localPort)],
-    { detached: true, stdio: "ignore" }
-  );
-  child.unref();
-
-  for (let i = 0; i < 20; i++) {
-    if (isBypassRunning()) break;
-    execSync("sleep 0.1", { stdio: "ignore" });
-  }
-
-  if (isBypassRunning()) {
-    info("bypass started: 127.0.0.1:443 → 127.0.0.1:" + localPort);
-  } else {
-    die("bypass failed to start. Try: sudo codex-relay proxy bypass");
-  }
-}
-
-function getLocalProxyPort() {
-  try {
-    if (isProxyRunning()) {
-      return parseInt(fs.readFileSync(PORT_FILE, "utf8").trim(), 10);
-    }
-  } catch {}
-  return null;
 }
 
 function cmdProxyTest(opts = {}) {
@@ -1102,17 +390,12 @@ function cmdProxyTest(opts = {}) {
   let proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy ||
                  process.env.HTTP_PROXY || process.env.http_proxy;
 
-  const localPort = getLocalProxyPort();
-  if (!proxyUrl && localPort) {
-    proxyUrl = `http://127.0.0.1:${localPort}`;
-  }
-
   if (!proxyUrl) {
     const cfg = loadConfig();
     proxyUrl = cfg.https || cfg.http;
   }
 
-  if (!proxyUrl && !localPort) {
+  if (!proxyUrl) {
     console.log(`Proxy:    (none configured)`);
     console.log(`Test URL: ${testUrl}`);
     console.log(`Result:   FAIL — No proxy configured.`);
@@ -1147,72 +430,7 @@ function cmdProxyTest(opts = {}) {
     allOk = false;
   }
 
-  // codex doctor integration
-  if (localPort && findCodex()) {
-    console.log(`\ncodex doctor:`);
-    try {
-      const env = { ...process.env,
-        HTTPS_PROXY: `http://127.0.0.1:${localPort}`,
-        HTTP_PROXY: `http://127.0.0.1:${localPort}`,
-        http_proxy: `http://127.0.0.1:${localPort}`,
-        https_proxy: `http://127.0.0.1:${localPort}`,
-        WS_PROXY: `http://127.0.0.1:${localPort}`,
-        WSS_PROXY: `http://127.0.0.1:${localPort}`,
-        NO_PROXY: "localhost,127.0.0.1,::1",
-      };
-      const out = execSync(`${findCodex()} doctor`, { encoding: "utf8", timeout: 25000, env });
-      // Extract key lines
-      const lines = out.split("\n");
-      const wsLine = lines.find((l) => l.includes("websocket") && l.includes("connected"));
-      const reachLine = lines.find((l) => l.includes("reachability") && l.includes("provider"));
-      const baseLine = lines.find((l) => l.includes("base URL"));
-      const handshakeLine = lines.find((l) => l.includes("handshake result"));
-      if (wsLine) {
-        const ok = wsLine.includes("✓") || wsLine.includes("connected");
-        console.log(`  ${ok ? "✓" : "✗"} websocket: ${wsLine.replace(/^\s+/, "").replace(/^\S+\s+/, "").trim()}`);
-        if (!ok) allOk = false;
-      }
-      if (handshakeLine) console.log(`    ${handshakeLine.trim()}`);
-      if (reachLine) {
-        const ok = reachLine.includes("✓") || reachLine.includes("reachable");
-        console.log(`  ${ok ? "✓" : "✗"} reachability: ${reachLine.replace(/^\s+/, "").replace(/^\S+\s+/, "").trim()}`);
-        if (!ok) allOk = false;
-      }
-      if (baseLine) console.log(`    ${baseLine.trim()}`);
-    } catch {
-      console.log(`  ✗ codex doctor: timeout or failed to run`);
-      allOk = false;
-    }
-  }
-
   if (!allOk) process.exit(1);
-}
-
-function cmdProxyStatus() {
-  const hbAge = (hbFile) => {
-    try {
-      const hb = parseInt(fs.readFileSync(hbFile, "utf8"), 10);
-      return `${Math.round((Date.now() - hb) / 1000)}s ago`;
-    } catch { return "N/A"; }
-  };
-  if (isProxyRunning()) {
-    const port = fs.readFileSync(PORT_FILE, "utf8").trim();
-    const pid = fs.readFileSync(PID_FILE, "utf8").trim();
-    console.log(`local daemon:   running (pid ${pid}, port ${port})`);
-    console.log(`  heartbeat:    ${hbAge(path.join(CONFIG_DIR, "proxy.heartbeat"))}`);
-  } else {
-    console.log("local daemon:   stopped");
-  }
-}
-
-function cmdProxyLogs() {
-  try {
-    const content = fs.readFileSync(LOG_FILE, "utf8");
-    if (!content.trim()) { console.log("(no logs)"); return; }
-    process.stdout.write(content);
-  } catch {
-    console.log("(no logs)");
-  }
 }
 
 function chainConfigFromOpts(cfg, opts = {}) {
@@ -1222,7 +440,6 @@ function chainConfigFromOpts(cfg, opts = {}) {
     upstreams: opts.upstream ? chainUpstreams(opts.upstream) : chain.upstreams || (chain.upstream ? [chain.upstream] : []),
     token: opts.token || "",
     tokenHash: opts.token ? "" : (chain.token_hash || cfg.chain_token_hash || cfg.chain_token || ""),
-    allow: opts.allow ? opts.allow.split(",").map((s) => s.trim()).filter(Boolean) : chain.allow || [],
     tlsCert: opts["tls-cert"] || chain.tls_cert || "",
     tlsKey: opts["tls-key"] || chain.tls_key || "",
   };
@@ -1233,7 +450,6 @@ function saveChainConfig(opts = {}) {
   const chain = cfg.chain || {};
   if (opts.listen) chain.listen = opts.listen;
   if (opts.upstream) chain.upstreams = chainUpstreams(opts.upstream);
-  if (opts.allow) chain.allow = opts.allow.split(",").map((s) => s.trim()).filter(Boolean);
   if (opts["tls-cert"]) chain.tls_cert = opts["tls-cert"];
   if (opts["tls-key"]) chain.tls_key = opts["tls-key"];
   cfg.chain = chain;
@@ -1420,126 +636,42 @@ function cmdProxyCheck() {
     }
   };
 
-  // 1. Upstream proxy config
+  // 1. Proxy config
   const cfg = loadConfig();
   const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy ||
                    process.env.HTTP_PROXY || process.env.http_proxy ||
                    cfg.https || cfg.http;
-  check("upstream proxy config", !!proxyUrl, proxyUrl || "not configured");
+  check("proxy config", !!proxyUrl, proxyUrl || "not configured — run: proxy set <url>");
 
-  // 2. Local proxy daemon
-  const localRunning = isProxyRunning();
-  if (localRunning) {
-    const port = fs.readFileSync(PORT_FILE, "utf8").trim();
-    check("local proxy daemon", true, `running on 127.0.0.1:${port}`);
-  } else {
-    check("local proxy daemon", false, "not running — start with: proxy start");
-  }
-
-  // 3. DNS cache
-  const cache = loadDnsCache();
-  const cacheEntries = Object.keys(cache).length;
-  check("DNS cache", cacheEntries > 0, `${cacheEntries} entries`);
-
-  // 4. curl available
+  // 2. curl available
   const haveCurl = !!shutil("curl");
   check("curl", haveCurl, haveCurl ? "available" : "not found — required for proxy test");
 
-  // 5. Upstream proxy connectivity (if configured)
+  // 3. Upstream proxy connectivity
   if (proxyUrl && haveCurl) {
     try {
       const out = execSync(
-        `curl -s -o /dev/null -w '%{http_code}' --proxy '${proxyUrl}' --connect-timeout 3 --max-time 6 'https://ipv4.icanhazip.com'`,
-        { encoding: "utf8", timeout: 8000 }
+        `curl -s -o /dev/null -w '%{http_code}' --proxy '${proxyUrl}' --connect-timeout 5 --max-time 10 'https://api.openai.com'`,
+        { encoding: "utf8", timeout: 15000 }
       ).trim();
       const code = parseInt(out, 10);
-      check("upstream reachable", code >= 200 && code < 500, `HTTP ${out}`);
+      check("api.openai.com reachable", code >= 200 && code < 500, `HTTP ${out}`);
     } catch {
-      check("upstream reachable", false, "connection failed — check proxy URL or network");
+      check("api.openai.com reachable", false, "connection failed — check proxy URL or network");
     }
   } else if (!haveCurl) {
-    check("upstream reachable", false, "curl not available");
+    check("api.openai.com reachable", false, "curl not available");
   } else {
-    check("upstream reachable", false, "no proxy configured");
+    check("api.openai.com reachable", false, "no proxy configured");
   }
 
-  // 6. api.openai.com reachable through local proxy (DNS + CONNECT)
-  if (localRunning) {
-    const port = fs.readFileSync(PORT_FILE, "utf8").trim();
-    const dnsCache = loadDnsCache();
-    const aoiEntry = dnsCache["api.openai.com"];
-    const bestIp = getBestIp("api.openai.com");
-    const allIps = (aoiEntry?.ips || []).map((e) => `${e.ok === true ? "✓" : e.ok === false ? "✗" : "·"}${e.ip}`);
-
-    // 6a + 6b. Single curl to api.openai.com: check CONNECT + HTTPS
-    const ipInfo = bestIp ? ` (best: ${bestIp})` : "";
-    let tunnelOk = false;
-    try {
-      const resp = execSync(
-        `curl -v -w '\\nHTTP_CODE:%{http_code}' -x 'http://127.0.0.1:${port}' ` +
-        `--connect-timeout 5 --max-time 8 'https://api.openai.com' -o /dev/null 2>&1 || true`,
-        { encoding: "utf8", timeout: 10000 }
-      );
-      tunnelOk = resp.includes("CONNECT phase completed") || resp.includes("tunnel established");
-      const httpMatch = resp.match(/HTTP_CODE:(\d+)/);
-      const httpCode = httpMatch ? parseInt(httpMatch[1], 10) : 0;
-
-      if (tunnelOk) {
-        check("api.openai.com CONNECT", true, `tunnel established via local proxy${ipInfo}`);
-      } else {
-        check("api.openai.com CONNECT", false, allIps.length > 0 ? `tunnel failed — IPs: ${allIps.join(", ")}` : "tunnel failed — run: dns cache");
-      }
-
-      if (tunnelOk) {
-        if (httpCode >= 200 && httpCode < 500) {
-          check("api.openai.com HTTPS", true, `HTTP ${httpCode}`);
-        } else {
-          check("api.openai.com HTTPS", false, `TLS handshake failed (HTTP ${httpCode || "000"})`);
-        }
-      }
-    } catch {
-      if (!tunnelOk) {
-        check("api.openai.com", false, "connection failed — check proxy and DNS cache");
-      }
-    }
-
-    // 6c. WebSocket transport check
-    if (tunnelOk && haveCurl) {
-      try {
-        const wsResp = execSync(
-          `curl -s -o /dev/null -w '%{http_code}' --proxy 'http://127.0.0.1:${port}' --connect-timeout 3 --max-time 5 ` +
-          `-H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' ` +
-          `-H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' ` +
-          `'https://httpbin.org/get' 2>/dev/null; true`,
-          { encoding: "utf8", timeout: 7000 }
-        ).trim();
-        const wsCode = parseInt(wsResp, 10) || 0;
-        if (wsCode >= 200 && wsCode < 500) {
-          check("WebSocket transport", true, `proxy tunnel works for WS (HTTP ${wsCode})`);
-        } else if (wsCode === 0) {
-          check("WebSocket transport", false, "TLS issue — may cause codex WebSocket timeout/fallback");
-        } else {
-          check("WebSocket transport", false, `HTTP ${wsCode}`);
-        }
-      } catch {
-        check("WebSocket transport", false, "timeout — check proxy latency");
-      }
-    }
-  } else {
-    check("api.openai.com", false, "local proxy not running");
-  }
-
-  // 7. npm available
+  // 4. npm available
   const haveNpm = !!shutil("npm");
   check("npm", haveNpm, haveNpm ? "available" : "not found — needed for codex install");
 
-  // 8. codex binary
+  // 5. codex binary
   const codexBin = findCodex();
   check("codex CLI", !!codexBin, codexBin ? codexVersion() : "not installed — run: install");
-
-  // 9. NO_PROXY
-  const noProxy = process.env.NO_PROXY || process.env.no_proxy || "";
-  check("NO_PROXY env", true, noProxy ? `set (${noProxy})` : "auto-set by `run` — local connections excluded from proxy");
 
   // ── Results ──
   console.log("codex-relay proxy check\n");
@@ -1558,51 +690,6 @@ function cmdProxyCheck() {
 
 function shutil(name) {
   try { execSync(`which ${name}`, { encoding: "utf8", stdio: "ignore" }); return true; } catch { return false; }
-}
-
-async function cmdDns(args) {
-  const sub = args[0];
-  switch (sub) {
-    case "resolve":
-    case "lookup": {
-      const host = args[1];
-      if (!host) die(`usage: ${NAME} dns resolve <host>`);
-      const ips = await resolveAllIPs(host);
-      if (ips.length > 0) {
-        console.log(`${host} → ${ips.join(", ")}`);
-      } else {
-        console.log(`${host} → FAILED`);
-        process.exit(1);
-      }
-      break;
-    }
-    case "cache": {
-      info("caching & testing DNS for OpenAI domains...");
-      await refreshDnsCache();
-      break;
-    }
-    case "show": {
-      const cache = loadDnsCache();
-      const entries = Object.entries(cache);
-      if (entries.length === 0) {
-        console.log("DNS cache is empty. Run: codex-relay dns cache");
-      } else {
-        const age = (ts) => {
-          if (!ts) return "never";
-          const sec = Math.round((Date.now() - ts) / 1000);
-          return sec < 60 ? `${sec}s ago` : `${Math.round(sec / 60)}m ago`;
-        };
-        const status = (e) => (e.ok === true ? "✓" : e.ok === false ? "✗" : "·");
-        for (const [host, entry] of entries) {
-          const ips = (entry.ips || []).map((e) => `${status(e)} ${e.ip}`).join(", ");
-          console.log(`${host.padEnd(30)} ${ips || "(no IPs)"}  (${age(entry.ts)})`);
-        }
-      }
-      break;
-    }
-    default:
-      die(`usage: ${NAME} dns {resolve <host>|cache|show}`);
-  }
 }
 
 async function cmdInstallSelf(opts = {}) {
@@ -1771,35 +858,22 @@ function cmdRun(args) {
 
   // Set up proxy for codex
   const env = { ...process.env };
-
-  // Prefer local forward proxy if running
   const noProxy = "localhost,127.0.0.1,::1,.local";
 
-  const localPort = getLocalProxyPort();
-  if (localPort) {
-    env.HTTP_PROXY = `http://127.0.0.1:${localPort}`;
-    env.HTTPS_PROXY = `http://127.0.0.1:${localPort}`;
-    env.http_proxy = `http://127.0.0.1:${localPort}`;
-    env.https_proxy = `http://127.0.0.1:${localPort}`;
-    env.WS_PROXY = `http://127.0.0.1:${localPort}`;
-    env.WSS_PROXY = `http://127.0.0.1:${localPort}`;
+  const cfg = loadConfig();
+  const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy ||
+                   process.env.HTTP_PROXY || process.env.http_proxy ||
+                   cfg.https || cfg.http;
+  if (proxyUrl) {
+    env.HTTP_PROXY = proxyUrl;
+    env.HTTPS_PROXY = proxyUrl;
+    env.http_proxy = proxyUrl;
+    env.https_proxy = proxyUrl;
+    env.WS_PROXY = proxyUrl;
+    env.WSS_PROXY = proxyUrl;
     env.NO_PROXY = noProxy;
     env.no_proxy = noProxy;
-    info(`using local forward proxy: 127.0.0.1:${localPort}`);
-  } else {
-    const cfg = loadConfig();
-    const proxyUrl = cfg.https || cfg.http;
-    if (proxyUrl) {
-      env.HTTP_PROXY = proxyUrl;
-      env.HTTPS_PROXY = proxyUrl;
-      env.http_proxy = proxyUrl;
-      env.https_proxy = proxyUrl;
-      env.WS_PROXY = proxyUrl;
-      env.WSS_PROXY = proxyUrl;
-      env.NO_PROXY = noProxy;
-      env.no_proxy = noProxy;
-      info(`using proxy: ${proxyUrl}`);
-    }
+    info(`using proxy: ${proxyUrl}`);
   }
 
   const proc = spawn(codexBin, args, { env, stdio: "inherit" });
@@ -1808,23 +882,24 @@ function cmdRun(args) {
 }
 
 function printHelp() {
-  console.log(`${NAME} — Node.js wrapper for OpenAI Codex CLI with proxy & local DNS resolution.
+  console.log(`${NAME} — Node.js wrapper for OpenAI Codex CLI with proxy support.
+
+  Two proxy modes:
+    1. Direct:   codex → static proxy → target
+    2. Chain:    codex → chain relay server → static proxy → target
 
   Commands:
-    proxy      Manage HTTP proxy & local forward daemon
-    chain      Run a middle-hop relay that forwards to a static proxy
-    dns        DNS pre-resolution & caching
+    proxy      Configure proxy & test connectivity
+    chain      Run a middle-hop chain relay server
     install    Install or update the OpenAI Codex CLI
     run        Run codex with proxy applied
 
   Any unrecognized command is passed directly to the codex CLI.
 
-  Workflow:
+  Quick start (direct mode):
     ${NAME} proxy set http://user:pass@host:8080
-    ${NAME} dns cache                                # pre-resolve OpenAI domains
-    ${NAME} proxy start                              # start local DNS-resolving proxy
-    ${NAME} run chat                                 # codex through local proxy
-    ${NAME} proxy stop                               # stop local proxy
+    ${NAME} proxy test                               # verify proxy works
+    ${NAME} run chat                                 # codex through proxy
 
   Commands:
     ${NAME} proxy set <url>                          - configure upstream proxy
@@ -1832,18 +907,12 @@ function printHelp() {
     ${NAME} proxy unset                              - clear proxy config
     ${NAME} proxy test [--url URL] [--timeout S]     - test connectivity
     ${NAME} proxy check                              - check for potential issues
-    ${NAME} proxy start                              - start local DNS-resolving proxy
-    ${NAME} proxy stop                               - stop local proxy
-    ${NAME} proxy logs                               - view proxy daemon logs
     ${NAME} chain config --listen 0.0.0.0:8080 \\
       --upstream http://proxy-a:8080,direct          - save chain relay config
     ${NAME} chain token generate                     - generate and save relay token
     ${NAME} chain start|stop|status|logs             - manage chain relay daemon
     ${NAME} chain serve --listen 0.0.0.0:8080 \\
-      --upstream http://user:pass@static-proxy:8080  - run middle-hop relay
-    ${NAME} dns resolve <host>                       - resolve hostname IP
-    ${NAME} dns cache                                - cache all OpenAI domain IPs
-    ${NAME} dns show                                 - show cached DNS entries
+      --upstream http://user:pass@static-proxy:8080  - run chain relay (foreground)
     ${NAME} install [--force]                        - install both codex-relay & codex CLI
     ${NAME} install --update                         - update codex CLI
     ${NAME} install --version X                      - install specific codex version
@@ -1865,15 +934,13 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--url" || argv[i] === "--timeout" || argv[i] === "--version" ||
         argv[i] === "--listen" || argv[i] === "--upstream" || argv[i] === "--token" ||
-        argv[i] === "--allow" || argv[i] === "--tls-cert" || argv[i] === "--tls-key") {
+        argv[i] === "--tls-cert" || argv[i] === "--tls-key") {
       opts[argv[i].replace(/^--/, "")] = argv[i + 1];
       i++;
     } else if (argv[i] === "--update") {
       opts.update = true;
     } else if (argv[i] === "--force") {
       opts.force = true;
-    } else if (argv[i] === "--remove") {
-      opts.remove = true;
     } else {
       opts._.push(argv[i]);
     }
@@ -1885,56 +952,8 @@ async function main() {
   const raw = process.argv.slice(2);
 
   // Hidden: daemon mode
-  if (raw[0] === "--_daemon") {
-    const upstreamUrl = raw[1];
-    if (!upstreamUrl) die("--_daemon requires upstream URL");
-    runProxyDaemon(upstreamUrl);
-    return;
-  }
   if (raw[0] === "--_chain-daemon") {
     runChainDaemon();
-    return;
-  }
-  if (raw[0] === "--_bypass-daemon") {
-    const proxyPort = parseInt(raw[1], 10);
-    if (!proxyPort) die("--_bypass-daemon requires proxy port");
-    runBypassDaemon(proxyPort);
-    return;
-  }
-  if (raw[0] === "--_bypass-setup") {
-    // Called via sudo: adds hosts + launches bypass daemon
-    const proxyPort = parseInt(raw[1], 10);
-    if (!proxyPort) die("--_bypass-setup requires proxy port");
-    if (isBypassRunning()) {
-      console.log("[codex-relay] bypass already running.");
-      return;
-    }
-    manageHosts("add");
-    // Use shell backgrounding to reliably detach
-    execSync(
-      `nohup "${process.execPath}" "${SCRIPT_PATH}" --_bypass-daemon ${proxyPort} > /dev/null 2>&1 &`,
-      { stdio: "ignore" }
-    );
-    for (let i = 0; i < 20; i++) {
-      if (isBypassRunning()) break;
-      execSync("sleep 0.1", { stdio: "ignore" });
-    }
-    if (isBypassRunning()) {
-      console.log("[codex-relay] bypass started: 127.0.0.1:443 → 127.0.0.1:" + proxyPort);
-    } else {
-      console.error("error: bypass daemon failed to start");
-      process.exit(1);
-    }
-    return;
-  }
-  if (raw[0] === "--_bypass-teardown") {
-    // Called via sudo: stops bypass daemon + removes hosts
-    if (isBypassRunning()) {
-      const pid = parseInt(fs.readFileSync(BYPASS_PID_FILE, "utf8").trim(), 10);
-      try { process.kill(pid, "SIGTERM"); } catch {}
-      cleanupBypassFiles();
-    }
-    manageHosts("remove");
     return;
   }
 
@@ -1960,22 +979,12 @@ async function main() {
         case "set": cmdProxySet(pargs._[0]); break;
         case "show": cmdProxyShow(); break;
         case "unset": cmdProxyUnset(); break;
-        case "start": cmdProxyStart(); break;
-        case "stop": cmdProxyStop(); break;
         case "test": cmdProxyTest(pargs); break;
-        case "bypass": cmdProxyBypass(pargs); break;
-        case "restart": cmdProxyStop(); cmdProxyStart(); break;
-        case "logs": cmdProxyLogs(); break;
-        case "status": cmdProxyStatus(); break;
         case "check": cmdProxyCheck(); break;
-        default: die(`usage: ${NAME} proxy {set|show|unset|test|start|stop|restart|check|logs|status}`);
+        default: die(`usage: ${NAME} proxy {set|show|unset|test|check}`);
       }
       break;
     }
-
-    case "dns":
-      await cmdDns(args);
-      break;
 
     case "chain":
       cmdChain(args);
