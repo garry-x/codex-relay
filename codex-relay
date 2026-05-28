@@ -531,22 +531,8 @@ function cmdProxyStart() {
     info(`HTTP_PROXY=http://127.0.0.1:${port} is active for codex sessions`);
   }
 
-  // Bypass: hosts + forwarder on 127.0.0.1:443 (needs sudo)
-  const port = fs.readFileSync(PORT_FILE, "utf8").trim();
-  if (isBypassRunning()) {
-    info("bypass already running (127.0.0.1:443 → 127.0.0.1:" + port + ")");
-  } else {
-    info("setting up bypass — sudo required for /etc/hosts and port 443 ...");
-    try {
-      execSync(
-        `sudo "${process.execPath}" "${SCRIPT_PATH}" --_bypass-setup ${port}`,
-        { stdio: "inherit" }
-      );
-    } catch {
-      info("bypass setup skipped (sudo failed or declined).");
-      info("run later: sudo " + NAME + " proxy bypass");
-    }
-  }
+  // Bypass is off by default since apps feature is disabled
+  // Run `codex-relay proxy bypass` to enable if needed (requires sudo)
 }
 
 function runProxyDaemon(upstreamUrl) {
@@ -630,18 +616,6 @@ function cmdProxyStop() {
     try { process.kill(pid, "SIGTERM"); } catch {}
     cleanupProxyFiles();
     info("local proxy stopped.");
-  }
-
-  if (isBypassRunning()) {
-    info("tearing down bypass — sudo may be required ...");
-    try {
-      execSync(
-        `sudo "${process.execPath}" "${SCRIPT_PATH}" --_bypass-teardown`,
-        { stdio: "inherit" }
-      );
-    } catch {
-      info("bypass teardown failed (run: sudo " + NAME + " proxy bypass --remove)");
-    }
   }
 }
 
