@@ -1,6 +1,6 @@
 # codex-relay
 
-OpenAI Codex CLI 的 Node.js 包装器，支持 HTTP 代理配置、本地 DNS 预解析、多 IP 连通性测试、本地转发代理，解决廉价代理（如 proxy-cheap）无法访问 OpenAI API 的问题。
+OpenAI Codex CLI 的 Node.js 包装器，支持 HTTP 代理配置、本地 DNS 预解析、多 IP 连通性测试、本地转发代理、链式中转代理，解决廉价代理（如 proxy-cheap）无法访问 OpenAI API 的问题。
 
 ## 安装
 
@@ -122,11 +122,18 @@ codex-relay proxy stop
 codex → 127.0.0.1:LOCAL_PORT → 本地 DNS 解析 → 上游代理(IP 直连) → OpenAI
 ```
 
+链式中转模式：
+
+```
+codex → 中间服务器 → 静态代理 → OpenAI
+```
+
 - codex 将本地代理视为普通 HTTP 代理，发送 `CONNECT api.openai.com:443`
 - 本地代理**在本地**解析目标域名的所有 IP，并测试每个 IP 的连通性
 - 本地代理向上游代理发送 `CONNECT <IP>:443`（上游无需解析域名）
 - 优先使用已确认可通的 IP，失败时自动重试下一个（最多 2 个）
 - 隧道建立后 transparently 转发 TCP 流量，支持 WebSocket
+- chain relay 自带 DNS 解析和 IP 改写；Codex 可直接连接 chain relay，本地代理层不再是必须项
 
 ## 命令一览
 
@@ -135,12 +142,82 @@ codex-relay
 
   Commands:
     proxy     管理代理配置 & 本地代理守护进程
+    chain     运行中间服务器链式中转
     dns       DNS 预解析与连通性测试
     install   安装或更新 Codex CLI
     run       通过代理运行 codex
 
   任何不认识的命令直接透传至 codex CLI
 ```
+
+## chain — 链式中转
+
+适用于“本机网络 → 中间服务器 → 静态代理 → OpenAI”的路径。中间服务器只做 TCP/HTTP 代理转发，不做 TLS 解密；最终目标仍由静态代理访问。
+
+chain relay 收到 `CONNECT api.openai.com:443` 后，会在中间服务器解析域名并改写为 `CONNECT <IP>:443` 再转发给静态代理。这样 Codex 可以直接使用 chain relay，无需先启动本地 `proxy start`。
+
+### 1. 在中间服务器启动链式中转
+
+```bash
+# 生成中间服务器访问 token；明文只输出这一次，配置文件只保存 hash
+codex-relay chain token generate
+
+# 保存中转配置：多个上游按顺序 fallback，direct 表示中间服务器直连目标
+codex-relay chain config \
+  --listen 0.0.0.0:8080 \
+  --upstream http://user:pass@static-proxy-a.example.com:8080,http://user:pass@static-proxy-b.example.com:8080,direct \
+  --allow api.openai.com,chatgpt.com,auth.openai.com
+
+# 后台启动中转服务
+codex-relay chain start
+```
+
+`chain token generate` 会把 token hash 写入 `~/.codex-relay/config.json`，明文 token 只在生成时打印一次。`--allow` 会根据原始目标域名限制访问目标，也支持 `.example.com` 后缀和 `172.64.0.0/13` 这类 IPv4 CIDR；中间服务器不会把内部 header 继续传给最终静态代理。
+
+常用管理命令：
+
+```bash
+codex-relay chain status
+codex-relay chain logs
+codex-relay chain restart
+codex-relay chain stop
+```
+
+如需前台运行，可直接使用：
+
+```bash
+codex-relay chain serve \
+  --listen 0.0.0.0:8080 \
+  --upstream http://user:pass@static-proxy.example.com:8080,direct \
+  --token TOKEN
+```
+
+如需本机到中间服务器使用 HTTPS，把证书配置到中间服务器：
+
+```bash
+codex-relay chain config \
+  --listen 0.0.0.0:8443 \
+  --upstream http://user:pass@static-proxy.example.com:8080,direct \
+  --tls-cert /etc/codex-relay/fullchain.pem \
+  --tls-key /etc/codex-relay/privkey.pem
+codex-relay chain restart
+```
+
+### 2. 在本机直接使用 chain relay
+
+```bash
+TOKEN=<paste-token-from-middle-server>
+codex-relay proxy set http://$TOKEN@relay.example.com:8080
+codex-relay run
+```
+
+如果中间服务器启用了 TLS：
+
+```bash
+codex-relay proxy set https://$TOKEN@relay.example.com:8443
+```
+
+此模式不需要启动本地代理守护进程。需要保留本地多 IP 预热和本地日志时，仍可使用 `codex-relay proxy start`，链路会变为“本地代理 → chain relay”。
 
 ## proxy — 代理配置与管理
 

@@ -2,7 +2,7 @@
 
 ## 概述
 
-codex-relay 是一个 Node.js 包装器，解决廉价 HTTP 代理（如 proxy-cheap）无法正常用于 OpenAI Codex CLI 的问题。
+codex-relay 是一个 Node.js 包装器，解决廉价 HTTP 代理（如 proxy-cheap）无法正常用于 OpenAI Codex CLI 的问题，并支持在本地代理和最终静态代理之间增加一跳中间服务器。
 
 ## 问题背景
 
@@ -32,6 +32,15 @@ codex-relay 通过本地 DNS 解析 + IP 改写解决第一个问题，第二个
                             └──────────┘
 ```
 
+链式中转模式：
+
+```
+┌─────────┐   HTTP_PROXY   ┌──────────────┐   CONNECT <IP>:443   ┌──────────┐   TCP   ┌──────────┐
+│  Codex  │ ──────────────→ │ chain relay  │ ────────────────────→ │ 静态代理  │ ──────→ │ OpenAI   │
+│   CLI   │  中间服务器 URL  │  relay server │   最终代理认证         │ (proxy)   │         │ Servers  │
+└─────────┘                 └──────────────┘                       └──────────┘         └──────────┘
+```
+
 ### 本地代理工作流程
 
 1. Codex CLI 通过 `HTTP_PROXY=http://127.0.0.1:PORT` 连接到本地代理
@@ -40,6 +49,8 @@ codex-relay 通过本地 DNS 解析 + IP 改写解决第一个问题，第二个
 4. 连接上游代理，发送 `CONNECT 172.66.0.243:443`（用 IP 绕过上游 DNS 过滤）
 5. 自动注入 `Proxy-Authorization: Basic ...`（上游代理凭证）
 6. 隧道建立后透明转发 TCP 流量
+
+如果 Codex 直接连接 `chain relay`，`chain relay` 会自己解析目标域名并改写为 `CONNECT <IP>:443`。本地代理层仍可作为可选前置层使用，但不再是链式中转必需组件。
 
 ## 组件
 
@@ -60,6 +71,38 @@ codex-relay 通过本地 DNS 解析 + IP 改写解决第一个问题，第二个
 }
 ```
 
+### 链式中转服务器 (chain relay)
+
+- 部署在中间服务器上
+- 监听普通 HTTP 代理端口，支持 `CONNECT` 和普通 HTTP 请求
+- 自行解析目标域名并把发给最终静态代理的请求改写为目标 IP
+- 使用配置文件中的 token hash 或 `--token` 校验本地客户端访问
+- 使用 `--upstream` 指定一个或多个最终静态代理，并只把最终静态代理凭证发给该代理
+- 支持 `direct` upstream，让中间服务器直接连接目标，作为 fallback 或主路径
+- 支持 `--allow` 目标 ACL，可配置精确域名、`.example.com` 后缀和 IPv4 CIDR；chain relay 会记录原始目标域名用于判断，转发到最终代理前会移除内部 header
+- 支持 `--tls-cert` / `--tls-key`，保护本机到中间服务器的链路
+- 不解密 TLS，只转发隧道流量
+
+部署示例：
+
+```bash
+codex-relay chain token generate
+
+codex-relay chain config \
+  --listen 0.0.0.0:8080 \
+  --upstream http://user:pass@static-proxy-a.example.com:8080,http://user:pass@static-proxy-b.example.com:8080,direct \
+  --allow api.openai.com,chatgpt.com,auth.openai.com
+
+codex-relay chain start
+```
+
+本机配置：
+
+```bash
+codex-relay proxy set http://TOKEN_FROM_MIDDLE_SERVER@relay.example.com:8080
+codex-relay run
+```
+
 ### 配置文件
 
 ```
@@ -77,6 +120,11 @@ codex-relay 通过本地 DNS 解析 + IP 改写解决第一个问题，第二个
 ```bash
 # 配置上游代理
 codex-relay proxy set http://user:pass@host:port
+
+# 在中间服务器运行链式中转
+codex-relay chain token generate
+codex-relay chain config --listen 0.0.0.0:8080 --upstream http://user:pass@static-proxy:8080,direct
+codex-relay chain start
 
 # 启动全部服务（本地代理 + bypass）
 codex-relay proxy start
