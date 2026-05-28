@@ -72,8 +72,11 @@ codex-relay chain token generate
 # 输出: AbCdEf123456...  ← 复制此 token，后续本机配置需要
 
 # 3. 保存中转配置
-#    --upstream 支持多个上游，按顺序 fallback
-#    direct 表示中间服务器直连目标（不经过代理）
+#    --upstream 可选：不传时自动使用 proxy set 的代理 URL
+#    显式指定时支持多个上游 fallback，direct 表示直连目标
+codex-relay chain config --listen 0.0.0.0:8080
+
+# 或者显式指定上游：
 codex-relay chain config \
   --listen 0.0.0.0:8080 \
   --upstream http://user:pass@static-proxy:8080,direct
@@ -119,7 +122,7 @@ codex-relay run
 
 | 命令 | 用途 |
 |---|---|
-| `chain config --listen --upstream [--tls-cert] [--tls-key]` | 保存中转配置 |
+| `chain config --listen [--upstream] [--tls-cert] [--tls-key]` | 保存中转配置（--upstream 可选，默认复用 proxy set） |
 | `chain token generate` | 生成 token，hash 写入配置，明文仅输出一次 |
 | `chain token show / unset` | 查看 / 清除 token |
 | `chain start / stop / restart` | 管理中转守护进程 |
@@ -140,7 +143,7 @@ codex-relay
     proxy check [--url URL] [--timeout S]  全面诊断 & 连通性测试
 
   链式中转:
-    chain config --listen --upstream   保存中转配置
+    chain config --listen [--upstream]  保存中转配置（--upstream 可选，复用 proxy set）
     chain token generate               生成访问 token
     chain start / stop / restart       后台守护进程
     chain status / logs                状态与日志

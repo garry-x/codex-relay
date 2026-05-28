@@ -251,11 +251,13 @@
     <strong>验证连通性</strong>
     <pre><span class="cmd">codex-relay proxy check</span></pre>
     输出示例：
-    <pre><span class="out">Proxy:    http://user:pass@host:47453
-Test URL: https://ipv4.icanhazip.com
-Status:   200
-Latency:  1153ms
-Result:   OK — proxy is reachable</span></pre>
+    <pre><span class="out">  ✓ proxy config (http://user:pass@host:47453)
+  ✓ curl (available)
+  ✓ proxy connectivity (HTTP 421, 1143ms → https://api.openai.com)
+  ✓ npm (available)
+  ✓ codex CLI (codex-cli 0.133.0)
+
+5 OK, 0 issues</span></pre>
   </li>
   <li>
     <strong>运行 codex</strong>
@@ -296,7 +298,10 @@ Result:   OK — proxy is reachable</span></pre>
   </li>
   <li>
     <strong>保存中转配置</strong>
-    <pre><span class="c"># 基础配置：多个上游按顺序 fallback，direct 表示直连目标</span>
+    <pre><span class="c"># --upstream 可选：不传时自动使用 proxy set 的代理</span>
+<span class="cmd">codex-relay chain config</span> <span class="val">--listen</span> 0.0.0.0:8080
+
+<span class="c"># 显式指定多上游 fallback + direct 直连：</span>
 <span class="cmd">codex-relay chain config</span> \
   <span class="val">--listen</span> 0.0.0.0:8080 \
   <span class="val">--upstream</span> http://user:pass@static-proxy:8080,direct
@@ -345,7 +350,7 @@ Result:   OK — proxy is reachable</span></pre>
 
 <table>
   <tr><th>命令</th><th>用途</th></tr>
-  <tr><td><code>chain config --listen --upstream</code></td><td>保存中转配置</td></tr>
+  <tr><td><code>chain config --listen [--upstream]</code></td><td>保存中转配置（--upstream 可选，复用 proxy set）</td></tr>
   <tr><td><code>chain token generate</code></td><td>生成 token，hash 写入配置</td></tr>
   <tr><td><code>chain token show / unset</code></td><td>查看 / 清除 token</td></tr>
   <tr><td><code>chain start / stop / restart</code></td><td>管理后台守护进程</td></tr>

@@ -54,7 +54,7 @@ codex → 链式中转服务器 → 静态代理 → OpenAI
 - 监听 HTTP 代理端口，接受 `CONNECT` 和普通 HTTP 请求
 - Token 认证：客户端 token 以 `Proxy-Authorization` header 传递，服务器端存储 SHA-256 hash
 - 上游代理认证注入：将静态代理的凭证注入 `Proxy-Authorization`
-- 多上游 fallback：按配置顺序尝试，任一成功即返回
+- 多上游 fallback：按配置顺序尝试，任一成功即返回；未配置 `--upstream` 时自动复用 `proxy set` 的代理
 - `direct` 上游：跳过静态代理，中间服务器直连目标
 - TLS：支持 `--tls-cert` / `--tls-key` 加密客户端到中转服务器链路
 
@@ -130,7 +130,7 @@ codex-relay proxy check
 
   ✓ proxy config (http://user:pass@host:8080)
   ✓ curl (available)
-  ✓ api.openai.com reachable (HTTP 421)
+  ✓ proxy connectivity (HTTP 421, 1143ms → https://api.openai.com)
   ✓ npm (available)
   ✓ codex CLI (codex-cli 0.133.0)
 
