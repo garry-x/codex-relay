@@ -340,6 +340,7 @@ function startChainRelay({ listen, upstreamUrl, upstreams, token, tokenHash, tls
   const { host: listenHost, port: listenPort } = parseListenAddr(listen);
   const upstreamList = chainUpstreams(upstreams || upstreamUrl);
   if (upstreamList.length === 0) die("chain relay requires at least one upstream or direct");
+  if (!tokenHash && !token) die("chain relay requires token authentication");
   const timeoutMs = 10000;
 
   const handle = (clientSocket) => {
@@ -347,7 +348,7 @@ function startChainRelay({ listen, upstreamUrl, upstreams, token, tokenHash, tls
     clientSocket.once("data", async (head) => {
       const headStr = head.toString();
       const presentedToken = proxyAuthToken(headStr);
-      if ((tokenHash && !tokenMatches(presentedToken, tokenHash)) || (token && presentedToken !== token)) {
+      if (!tokenMatches(presentedToken, tokenHash || token)) {
         try {
           clientSocket.write("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"codex-relay-chain\"\r\n\r\n");
           clientSocket.end();
@@ -385,8 +386,7 @@ function startChainRelay({ listen, upstreamUrl, upstreams, token, tokenHash, tls
     chainLog(`chain relay listening on ${listenHost}:${listenPort}`);
     info(`chain relay listening on ${listenHost}:${listenPort}${tlsCert ? " (TLS)" : ""}`);
     info(`upstreams: ${upstreamList.map(redactProxyUrl).join(", ")}`);
-    if (token || tokenHash) info("client auth: enabled");
-    else info("client auth: disabled");
+    info("client auth: enabled");
   });
   return server;
 }
@@ -436,7 +436,7 @@ function chainConfigFromOpts(cfg, opts = {}) {
     listen: opts.listen || chain.listen || "127.0.0.1:8080",
     upstreams,
     token: opts.token || "",
-    tokenHash: opts.token ? "" : (chain.token_hash || cfg.chain_token_hash || cfg.chain_token || ""),
+    tokenHash: chain.token_hash || "",
     tlsCert: opts["tls-cert"] || chain.tls_cert || "",
     tlsKey: opts["tls-key"] || chain.tls_key || "",
   };
@@ -513,13 +513,33 @@ function cmdChainStart() {
     info(`chain relay already running (pid ${pid})`);
     return;
   }
-  const child = spawn(process.execPath, [SCRIPT_PATH, "--_chain-daemon"], { detached: true, stdio: "ignore" });
+  // Ensure token is configured
+  const cfg = loadConfig();
+  const chain = cfg.chain || {};
+  if (!chain.token_hash) {
+    const token = generateToken();
+    chain.token_hash = hashToken(token);
+    cfg.chain = chain;
+    saveConfig(cfg);
+    console.log(token);
+    info(`access token generated. Save this token — it will not be shown again.`);
+  }
+  // Capture stderr so startup errors are visible
+  let errBuf = "";
+  const child = spawn(process.execPath, [SCRIPT_PATH, "--_chain-daemon"], {
+    detached: true,
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  child.stderr.on("data", (chunk) => { errBuf += chunk.toString(); });
   child.unref();
   for (let i = 0; i < 20; i++) {
     if (isChainRunning()) break;
     execSync("sleep 0.1", { stdio: "ignore" });
   }
-  if (!isChainRunning()) die("failed to start chain relay daemon");
+  if (!isChainRunning()) {
+    const errMsg = errBuf.trim();
+    die(`failed to start chain relay daemon${errMsg ? ":\n" + errMsg : ""}`);
+  }
   const pid = fs.readFileSync(CHAIN_PID_FILE, "utf8").trim();
   info(`chain relay started (pid ${pid})`);
 }
@@ -587,21 +607,16 @@ function cmdChain(args) {
         const token = generateToken();
         cfg.chain = cfg.chain || {};
         cfg.chain.token_hash = hashToken(token);
-        delete cfg.chain_token;
-        delete cfg.chain_token_hash;
         saveConfig(cfg);
         console.log(token);
-        info(`chain token hash saved to ${CONFIG_FILE}. Save this token now; it cannot be shown later.`);
+        info(`chain token hash saved. Save this token now; it cannot be shown later.`);
       } else if (sub === "show") {
-        if (cfg.chain?.token_hash || cfg.chain_token_hash) {
+        if (cfg.chain?.token_hash) {
           die("chain token is stored as a hash and cannot be shown. Generate a new one if needed.");
         }
-        if (!cfg.chain_token) die(`no chain token configured. Run: ${NAME} chain token generate`);
-        console.log(cfg.chain_token);
+        die(`no chain token configured. Run: ${NAME} chain start (auto-generates) or chain token generate`);
       } else if (sub === "unset" || sub === "clear") {
         if (cfg.chain) delete cfg.chain.token_hash;
-        delete cfg.chain_token_hash;
-        delete cfg.chain_token;
         saveConfig(cfg);
         info("chain token cleared.");
       } else {
