@@ -33,7 +33,7 @@ codex-relay proxy set http://user:pass@your-proxy.com:8080
 # 4. 预解析 OpenAI 域名并测试连通性
 codex-relay dns cache
 
-# 5. 启动本地代理（含 sudo bypass，输入系统密码）
+# 5. 启动本地代理
 codex-relay proxy start
 
 # 6. 检查一切是否就绪
@@ -106,7 +106,7 @@ codex-relay proxy set http://user:pass@proxy.example.com:8080
 # 2. 预解析 OpenAI 域名并测试连通性
 codex-relay dns cache
 
-# 3. 启动本地转发代理（含 sudo bypass）
+# 3. 启动本地转发代理
 codex-relay proxy start
 
 # 4. 运行 codex
@@ -148,15 +148,13 @@ codex-relay
 codex-relay proxy set <url>              # 配置上游代理
 codex-relay proxy show                   # 查看当前配置和状态
 codex-relay proxy unset                  # 清除代理配置
-codex-relay proxy start                  # 启动本地代理 + bypass
-codex-relay proxy stop                   # 停止所有守护进程
+codex-relay proxy start                  # 启动本地代理
+codex-relay proxy stop                   # 停止本地代理
 codex-relay proxy restart                # 重启（stop + start）
 codex-relay proxy status                 # 守护进程健康检查
 codex-relay proxy test [--url URL]       # 连通性测试 + codex doctor
-codex-relay proxy check                  # 全面诊断（12 项检查）
+codex-relay proxy check                  # 全面诊断（9 项检查）
 codex-relay proxy logs                   # 查看代理请求日志
-codex-relay proxy bypass                 # 手动启用 bypass
-codex-relay proxy bypass --remove        # 手动禁用 bypass
 ```
 
 ### 连通性测试（`proxy test`）
@@ -165,7 +163,7 @@ codex-relay proxy bypass --remove        # 手动禁用 bypass
 codex-relay proxy test
 ```
 
-输出包含代理连通性、bypass 状态、codex doctor 结果：
+输出包含代理连通性和 codex doctor 结果：
 
 ```
 Proxy:    http://127.0.0.1:50129
@@ -173,10 +171,6 @@ Test URL: https://ipv4.icanhazip.com
 Status:   200
 Latency:  1100ms
 Result:   OK — proxy is reachable
-
-Bypass check:
-  Mode:    active (127.0.0.1:443 → 127.0.0.1:50129)
-  DNS:     chatgpt.com → 127.0.0.1 (hosts override OK)
 
 codex doctor:
   ✓ websocket: connected (HTTP 101 Switching Protocols)
@@ -191,7 +185,7 @@ codex doctor:
 codex-relay proxy check
 ```
 
-检查上游配置、daemon 状态、DNS 缓存、curl、上游可达性、api.openai.com CONNECT + HTTPS、WebSocket 传输、bypass 状态、端口可用性、hosts 冲突、npm、codex CLI、NO_PROXY — 共 12 项。
+检查上游配置、daemon 状态、DNS 缓存、curl、上游可达性、api.openai.com CONNECT + HTTPS、WebSocket 传输、npm、codex CLI、NO_PROXY。
 
 ### 守护进程状态（`proxy status`）
 
@@ -200,8 +194,6 @@ codex-relay proxy status
 
 local daemon:   running (pid 71594, port 55678)
   heartbeat:    12s ago
-bypass daemon:  active
-  heartbeat:    8s ago
 ```
 
 ### 请求日志（`proxy logs`）
@@ -281,25 +273,6 @@ codex-relay install --update      # 仅更新 Codex CLI
 codex-relay install --version X   # 安装指定版本
 ```
 
-## Bypass（MCP server 代理绕过）
-
-codex 内置的 `codex_apps` MCP server 使用 Rust reqwest 客户端，忽略 `HTTP_PROXY` 环境变量。bypass 通过系统级 `/etc/hosts` + 端口转发拦截此类直连流量。
-
-详见 [docs/architecture.md](docs/architecture.md#mcp-codex_apps-启动失败)。
-
-```bash
-# 安装后自动启用（需要 sudo 密码）
-codex-relay proxy start
-
-# 如果 sudo 失败，手动启用
-sudo codex-relay proxy bypass
-
-# 禁用
-sudo codex-relay proxy bypass --remove
-# 或通过 codex feature flag
-codex features disable apps
-```
-
 ## 代理解析优先级
 
 本地代理守护进程（如已启动） > `HTTP_PROXY` 环境变量 > `proxy set` 配置
@@ -315,9 +288,7 @@ codex features disable apps
 ├── proxy.pid            # 本地代理进程 PID
 ├── proxy.port           # 本地代理监听端口
 ├── proxy.log            # 请求日志 + 守护进程生命周期
-├── proxy.heartbeat      # 本地代理心跳时间戳
-├── bypass.pid           # bypass 进程 PID
-└── bypass.heartbeat     # bypass 心跳时间戳
+└── proxy.heartbeat      # 本地代理心跳时间戳
 ```
 
 ### config.json

@@ -486,12 +486,6 @@ function cmdProxyShow() {
     console.log(`effective proxy: none`);
   }
 
-  // Bypass status
-  if (isBypassRunning()) {
-    console.log(`bypass:          active (127.0.0.1:443 → local proxy)`);
-  } else if (localPort) {
-    console.log(`bypass:          stopped (run: sudo ${NAME} proxy bypass)`);
-  }
 }
 
 function cmdProxyUnset() {
@@ -606,7 +600,7 @@ function runProxyDaemon(upstreamUrl) {
 }
 
 function cmdProxyStop() {
-  if (!isProxyRunning() && !isBypassRunning()) {
+  if (!isProxyRunning()) {
     info("no proxy daemon running.");
     return;
   }
@@ -835,47 +829,6 @@ function cmdProxyTest(opts = {}) {
     allOk = false;
   }
 
-  // Bypass verification
-  if (isBypassRunning()) {
-    console.log(`\nBypass check:`);
-    console.log(`  Mode:    active (127.0.0.1:443 → 127.0.0.1:${localPort})`);
-
-    // Verify hosts override
-    try {
-      const resolved = execSync(`dscacheutil -q host -a name chatgpt.com 2>/dev/null | grep "ip_address"`, { encoding: "utf8", timeout: 2000 }).trim();
-      const ips = resolved.split("\n").map((l) => l.replace("ip_address:", "").trim());
-      if (ips.some((ip) => ip === "127.0.0.1")) {
-        console.log(`  DNS:     chatgpt.com → 127.0.0.1 (hosts override OK)`);
-      } else {
-        console.log(`  DNS:     chatgpt.com → ${ips.join(", ")} (hosts override MISSING)`);
-        allOk = false;
-      }
-    } catch {
-      console.log(`  DNS:     could not verify hosts override`);
-      allOk = false;
-    }
-
-    // Test connectivity through bypass chain
-    try {
-      const out = execSync(
-        `curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 8 'https://chatgpt.com/backend-api/wham/apps'`,
-        { encoding: "utf8", timeout: 10000 }
-      ).trim();
-      const code = parseInt(out, 10);
-      if (code >= 200 && code < 500) {
-        console.log(`  Target:  chatgpt.com reachable (HTTP ${out})`);
-      } else {
-        console.log(`  Target:  chatgpt.com returned HTTP ${out}`);
-        allOk = false;
-      }
-    } catch {
-      console.log(`  Target:  chatgpt.com unreachable — check upstream proxy`);
-      allOk = false;
-    }
-  } else if (localPort) {
-    console.log(`\nBypass check: stopped — run: sudo ${NAME} proxy bypass`);
-  }
-
   // codex doctor integration
   if (localPort && findCodex()) {
     console.log(`\ncodex doctor:`);
@@ -931,12 +884,6 @@ function cmdProxyStatus() {
     console.log(`  heartbeat:    ${hbAge(path.join(CONFIG_DIR, "proxy.heartbeat"))}`);
   } else {
     console.log("local daemon:   stopped");
-  }
-  if (isBypassRunning()) {
-    console.log(`bypass daemon:  active`);
-    console.log(`  heartbeat:    ${hbAge(path.join(CONFIG_DIR, "bypass.heartbeat"))}`);
-  } else {
-    console.log("bypass daemon:  stopped");
   }
 }
 
@@ -1071,52 +1018,15 @@ function cmdProxyCheck() {
     check("api.openai.com", false, "local proxy not running");
   }
 
-  // 7. Bypass status
-  const bypassRunning = isBypassRunning();
-  check("bypass (MCP fix)", bypassRunning, bypassRunning ? "active" : "not running — sudo proxy bypass");
-
-  // 8. Port 443 availability for bypass
-  if (!bypassRunning) {
-    const testServer = require("net").createServer();
-    let port443Free = false;
-    try {
-      testServer.listen(443, "127.0.0.1");
-      port443Free = true;
-      testServer.close();
-    } catch {
-      port443Free = false;
-    }
-    check("bypass port 127.0.0.1:443", port443Free, port443Free ? "available" : "in use — bypass may fail");
-  }
-
-  // 9. hosts file conflicts
-  try {
-    const hosts = fs.readFileSync("/etc/hosts", "utf8");
-    const ourMarker = "# codex-relay-bypass";
-    const ourEntries = hosts.split("\n").filter((l) => l.includes(ourMarker));
-    const otherChatgpt = hosts.split("\n").filter((l) =>
-      l.includes("chatgpt.com") && !l.includes(ourMarker) && l.trim() && !l.trim().startsWith("#")
-    );
-    if (otherChatgpt.length > 0 && !bypassRunning) {
-      check("hosts file", false, `chatgpt.com has conflicting entries: ${otherChatgpt.join("; ")}`);
-    } else if (bypassRunning && ourEntries.length > 0) {
-      check("hosts file", true, "bypass entries present");
-    } else {
-      check("hosts file", true, "no conflicts");
-    }
-  } catch {
-    check("hosts file", false, "cannot read /etc/hosts");
-  }
-
-  // 10. npm available
+  // 7. npm available
   const haveNpm = !!shutil("npm");
   check("npm", haveNpm, haveNpm ? "available" : "not found — needed for codex install");
 
-  // 11. codex binary
+  // 8. codex binary
   const codexBin = findCodex();
   check("codex CLI", !!codexBin, codexBin ? codexVersion() : "not installed — run: install");
 
-  // 12. NO_PROXY
+  // 9. NO_PROXY
   const noProxy = process.env.NO_PROXY || process.env.no_proxy || "";
   check("NO_PROXY env", true, noProxy ? `set (${noProxy})` : "auto-set by `run` — local connections excluded from proxy");
 
@@ -1413,8 +1323,6 @@ function printHelp() {
     ${NAME} proxy start                              - start local DNS-resolving proxy
     ${NAME} proxy stop                               - stop local proxy
     ${NAME} proxy logs                               - view proxy daemon logs
-    ${NAME} proxy bypass                             - toggle bypass standalone
-    ${NAME} proxy bypass --remove                    - disable bypass standalone
     ${NAME} dns resolve <host>                       - resolve hostname IP
     ${NAME} dns cache                                - cache all OpenAI domain IPs
     ${NAME} dns show                                 - show cached DNS entries
@@ -1536,7 +1444,7 @@ async function main() {
         case "logs": cmdProxyLogs(); break;
         case "status": cmdProxyStatus(); break;
         case "check": cmdProxyCheck(); break;
-        default: die(`usage: ${NAME} proxy {set|show|unset|test|start|stop|restart|bypass|check|logs}`);
+        default: die(`usage: ${NAME} proxy {set|show|unset|test|start|stop|restart|check|logs|status}`);
       }
       break;
     }

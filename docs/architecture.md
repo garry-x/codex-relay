@@ -41,43 +41,16 @@ codex-relay 通过本地 DNS 解析 + IP 改写解决第一个问题，第二个
 5. 自动注入 `Proxy-Authorization: Basic ...`（上游代理凭证）
 6. 隧道建立后透明转发 TCP 流量
 
-### bypass 模式（针对 MCP server）
-
-```
-Codex MCP server (ignore HTTP_PROXY)
-  │
-  │ 直连 chatgpt.com:443
-  │   → /etc/hosts: 127.0.0.1 chatgpt.com
-  ▼
-127.0.0.1:443 (bypass daemon, root)
-  │
-  │ TCP 转发
-  ▼
-127.0.0.1:PORT (local proxy)
-  │
-  │ DNS 本地解析 + IP 直连上游
-  ▼
-上游代理 → chatgpt.com
-```
-
-MCP server (`codex_apps`) 内嵌的 Rust HTTP 库（reqwest）编译时未启用 proxy 支持，忽略 `HTTP_PROXY` 环境变量直接连接目标。bypass 通过系统级 `/etc/hosts` + 端口转发拦截此类流量。
-
 ## 组件
 
-### 1. 本地代理守护进程 (codex-relay-proxy)
+### 本地代理守护进程 (codex-relay-proxy)
 
 - 普通用户进程，监听 `127.0.0.1:随机高端口`
 - 处理 HTTP CONNECT 和普通 HTTP 请求
 - 本地 DNS 解析 + IP 改写 + Proxy-Auth 注入
 - DNS 缓存每 5 分钟自动刷新
 
-### 2. bypass 守护进程 (codex-relay-bypass)
-
-- root 进程（需 sudo），监听 `127.0.0.1:443`
-- 纯 TCP 转发：接收 → 转发到本地代理端口
-- 配合 `/etc/hosts` 拦截不遵循 proxy 环境变量的程序
-
-### 3. DNS 缓存
+### DNS 缓存
 
 ```json
 {
@@ -87,7 +60,7 @@ MCP server (`codex_apps`) 内嵌的 Rust HTTP 库（reqwest）编译时未启用
 }
 ```
 
-### 4. 配置文件
+### 配置文件
 
 ```
 ~/.codex-relay/
