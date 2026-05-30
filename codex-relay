@@ -37,21 +37,22 @@ const CHAIN_HEARTBEAT_FILE = path.join(CONFIG_DIR, "chain.heartbeat");
 const CHAIN_LOG_FILE = path.join(CONFIG_DIR, "chain.log");
 const MAX_LOG_LINES = 500;
 
+let _logCount = 0;
 function chainLog(msg) {
-  appendLog(CHAIN_LOG_FILE, msg);
-}
-
-function appendLog(file, msg) {
   const ts = new Date().toISOString();
   const line = `${ts} ${msg}\n`;
-  try {
-    fs.appendFileSync(file, line);
-    // Rotate if too large
-    const lines = fs.readFileSync(file, "utf8").split("\n");
-    if (lines.length > MAX_LOG_LINES + 50) {
-      fs.writeFileSync(file, lines.slice(-MAX_LOG_LINES).join("\n"));
-    }
-  } catch {}
+  // Async write — never block the hot path on disk I/O
+  fs.appendFile(CHAIN_LOG_FILE, line, () => {});
+  // Rotate every ~100 writes instead of every line
+  _logCount++;
+  if (_logCount % 100 === 0) {
+    try {
+      const lines = fs.readFileSync(CHAIN_LOG_FILE, "utf8").split("\n");
+      if (lines.length > MAX_LOG_LINES + 50) {
+        fs.writeFileSync(CHAIN_LOG_FILE, lines.slice(-MAX_LOG_LINES).join("\n"));
+      }
+    } catch {}
+  }
 }
 
 // Resolve script path (handle relative paths for sudo)
@@ -161,6 +162,8 @@ function connectProxySocket(proxyUrl, onConnect) {
   const sock = scheme === "https"
     ? tls.connect({ host, port, servername: host, rejectUnauthorized: false }, onConnect)
     : net.connect(port, host, onConnect);
+  sock.setNoDelay(true);
+  sock.setKeepAlive(true, 30000);
   return sock;
 }
 
@@ -175,39 +178,52 @@ function parseListenAddr(value) {
 }
 
 function stripProxyAuthorization(headStr) {
-  return headStr.replace(/^Proxy-Authorization:.*\r\n/gim, "");
+  const start = headStr.indexOf("Proxy-Authorization:");
+  if (start === -1) return headStr;
+  const end = headStr.indexOf("\r\n", start);
+  return end === -1 ? headStr : headStr.slice(0, start) + headStr.slice(end + 2);
 }
 
 function addProxyAuthorization(headStr, auth) {
-  const stripped = stripProxyAuthorization(headStr);
-  if (!auth) return stripped;
-  return stripped.replace(
-    /\r\n\r\n$/,
-    `\r\nProxy-Authorization: Basic ${auth}\r\n\r\n`
-  );
+  const cleaned = stripProxyAuthorization(headStr);
+  if (!auth) return cleaned;
+  const end = cleaned.lastIndexOf("\r\n\r\n");
+  if (end === -1) return cleaned + `Proxy-Authorization: Basic ${auth}\r\n\r\n`;
+  return cleaned.slice(0, end) + `\r\nProxy-Authorization: Basic ${auth}` + cleaned.slice(end);
 }
 
 function addInternalHostHeader(headStr, host) {
-  return headStr.replace(/^X-Codex-Relay-Host:.*\r\n/gim, "").replace(
-    /\r\n\r\n$/,
-    `\r\nX-Codex-Relay-Host: ${host}\r\n\r\n`
-  );
+  const cleaned = stripInternalHeaders(headStr);
+  const end = cleaned.lastIndexOf("\r\n\r\n");
+  if (end === -1) return cleaned + `X-Codex-Relay-Host: ${host}\r\n\r\n`;
+  return cleaned.slice(0, end) + `\r\nX-Codex-Relay-Host: ${host}` + cleaned.slice(end);
 }
 
 function stripInternalHeaders(headStr) {
-  return headStr.replace(/^X-Codex-Relay-Host:.*\r\n/gim, "");
+  const start = headStr.indexOf("X-Codex-Relay-Host:");
+  if (start === -1) return headStr;
+  const end = headStr.indexOf("\r\n", start);
+  return end === -1 ? headStr : headStr.slice(0, start) + headStr.slice(end + 2);
 }
 
 function internalHost(headStr) {
-  const m = headStr.match(/^X-Codex-Relay-Host:\s*([^\r\n]+)\s*$/im);
-  return m ? m[1].trim() : "";
+  const prefix = "X-Codex-Relay-Host: ";
+  const idx = headStr.indexOf(prefix);
+  if (idx === -1) return "";
+  const valStart = idx + prefix.length;
+  const lineEnd = headStr.indexOf("\r\n", valStart);
+  return lineEnd === -1 ? headStr.slice(valStart).trim() : headStr.slice(valStart, lineEnd).trim();
 }
 
 function proxyAuthToken(headStr) {
-  const m = headStr.match(/^Proxy-Authorization:\s*Basic\s+([A-Za-z0-9+/=]+)\s*$/im);
-  if (!m) return "";
+  const prefix = "Proxy-Authorization: Basic ";
+  const idx = headStr.indexOf(prefix);
+  if (idx === -1) return "";
+  const valStart = idx + prefix.length;
+  const lineEnd = headStr.indexOf("\r\n", valStart);
+  const val = lineEnd === -1 ? headStr.slice(valStart) : headStr.slice(valStart, lineEnd);
   try {
-    const decoded = Buffer.from(m[1], "base64").toString("utf8");
+    const decoded = Buffer.from(val.trim(), "base64").toString("utf8");
     const colon = decoded.indexOf(":");
     return colon >= 0 ? decoded.slice(0, colon) : decoded;
   } catch {
@@ -225,17 +241,39 @@ function redactProxyUrl(url) {
 }
 
 function connectTargetFromHead(headStr) {
-  const connectMatch = headStr.match(/^CONNECT (.+):(\d+)/m);
-  if (connectMatch) return { mode: "connect", host: connectMatch[1], port: parseInt(connectMatch[2], 10) };
-  const reqMatch = headStr.match(/^([A-Z]+) http:\/\/([^/:]+)(:\d+)?(\/[^\s]*)? HTTP\/[0-9.]+\r\n/m);
-  if (!reqMatch) return null;
-  return {
-    mode: "http",
-    host: reqMatch[2],
-    port: reqMatch[3] ? parseInt(reqMatch[3].slice(1), 10) : 80,
-    method: reqMatch[1],
-    path: reqMatch[4] || "/",
-  };
+  const firstSpace = headStr.indexOf(" ");
+  if (firstSpace === -1) return null;
+  const method = headStr.slice(0, firstSpace);
+
+  if (method === "CONNECT") {
+    const hostStart = firstSpace + 1;
+    const hostEnd = headStr.indexOf(" ", hostStart);
+    if (hostEnd === -1) return null;
+    const hostPort = headStr.slice(hostStart, hostEnd);
+    const colonIdx = hostPort.lastIndexOf(":");
+    if (colonIdx === -1) return null;
+    return {
+      mode: "connect",
+      host: hostPort.slice(0, colonIdx),
+      port: parseInt(hostPort.slice(colonIdx + 1), 10),
+    };
+  }
+
+  const urlStart = firstSpace + 1;
+  const urlEnd = headStr.indexOf(" ", urlStart);
+  if (urlEnd === -1) return null;
+  const url = headStr.slice(urlStart, urlEnd);
+  if (!url.startsWith("http://")) return null;
+
+  const hostStart = 7;
+  const pathStart = url.indexOf("/", hostStart);
+  const hostPortPart = pathStart === -1 ? url.slice(hostStart) : url.slice(hostStart, pathStart);
+  const colonIdx = hostPortPart.indexOf(":");
+  const host2 = colonIdx === -1 ? hostPortPart : hostPortPart.slice(0, colonIdx);
+  const port = colonIdx === -1 ? 80 : parseInt(hostPortPart.slice(colonIdx + 1), 10);
+  const path = pathStart === -1 ? "/" : url.slice(pathStart);
+
+  return { mode: "http", host: host2, port, method, path };
 }
 
 function prepareChainTarget(headStr, target, reqId) {
@@ -248,10 +286,12 @@ function prepareChainTarget(headStr, target, reqId) {
   };
 }
 
-function tryChainUpstream(clientSocket, headStr, upstreamUrl, target, reqId, timeoutMs) {
+function tryChainUpstream(clientSocket, headStr, upstreamUrl, upstreamAuth, target, reqId, timeoutMs) {
   return new Promise((resolve) => {
     if (upstreamUrl === "direct") {
       const direct = net.connect(target.port, target.host);
+      direct.setNoDelay(true);
+      direct.setKeepAlive(true, 30000);
       const timer = setTimeout(() => {
         chainLog(`${reqId} direct ${target.host}:${target.port} connect timeout`);
         try { direct.destroy(); } catch {}
@@ -260,13 +300,18 @@ function tryChainUpstream(clientSocket, headStr, upstreamUrl, target, reqId, tim
       direct.once("connect", () => {
         clearTimeout(timer);
         chainLog(`${reqId} direct ${target.host}:${target.port} OK`);
-        direct.setKeepAlive(true, 30000);
-        clientSocket.setKeepAlive(true, 30000);
         if (target.mode === "connect") {
           clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
         } else {
-          const originHead = stripInternalHeaders(stripProxyAuthorization(headStr))
-            .replace(/^([A-Z]+) http:\/\/[^/\s]+([^\s]*) HTTP\/([0-9.]+)/m, `$1 ${target.path} HTTP/$3`);
+          const cleaned = stripInternalHeaders(stripProxyAuthorization(headStr));
+          const lineEnd = cleaned.indexOf("\r\n");
+          const firstLine = lineEnd === -1 ? cleaned : cleaned.slice(0, lineEnd);
+          const tail = lineEnd === -1 ? "" : cleaned.slice(lineEnd);
+          const sp1 = firstLine.indexOf(" ");
+          const sp2 = firstLine.lastIndexOf(" ");
+          const method = firstLine.slice(0, sp1);
+          const httpVer = firstLine.slice(sp2);
+          const originHead = method + " " + target.path + httpVer + tail;
           direct.write(originHead);
         }
         clientSocket.pipe(direct);
@@ -282,14 +327,11 @@ function tryChainUpstream(clientSocket, headStr, upstreamUrl, target, reqId, tim
       return;
     }
 
-    const { auth } = parseProxyUrl(upstreamUrl);
-    const upstreamHead = addProxyAuthorization(stripInternalHeaders(headStr), auth);
+    const upstreamHead = addProxyAuthorization(stripInternalHeaders(headStr), upstreamAuth);
     const upstream = connectProxySocket(upstreamUrl, () => {
       upstream.write(upstreamHead);
       if (target.mode !== "connect") {
         chainLog(`${reqId} upstream ${redactProxyUrl(upstreamUrl)} HTTP forward`);
-        upstream.setKeepAlive(true, 30000);
-        clientSocket.setKeepAlive(true, 30000);
         clientSocket.pipe(upstream);
         upstream.pipe(clientSocket);
         clearTimeout(timer);
@@ -313,8 +355,6 @@ function tryChainUpstream(clientSocket, headStr, upstreamUrl, target, reqId, tim
       upstream.removeAllListeners("data");
       if (respStr.startsWith("HTTP/1.1 200") || respStr.startsWith("HTTP/1.0 200")) {
         chainLog(`${reqId} upstream ${redactProxyUrl(upstreamUrl)} OK`);
-        upstream.setKeepAlive(true, 30000);
-        clientSocket.setKeepAlive(true, 30000);
         clientSocket.write(respStr);
         const leftover = respBuf.slice(headerEnd + 4);
         if (leftover.length > 0) clientSocket.write(leftover);
@@ -339,11 +379,14 @@ function tryChainUpstream(clientSocket, headStr, upstreamUrl, target, reqId, tim
 function startChainRelay({ listen, upstreamUrl, upstreams, token, tokenHash, tlsCert, tlsKey }) {
   const { host: listenHost, port: listenPort } = parseListenAddr(listen);
   const upstreamList = chainUpstreams(upstreams || upstreamUrl);
+  const upstreamAuths = upstreamList.map(u => u === "direct" ? "" : parseProxyUrl(u).auth);
   if (upstreamList.length === 0) die("chain relay requires at least one upstream or direct");
   if (!tokenHash && !token) die("chain relay requires token authentication");
   const timeoutMs = 10000;
 
   const handle = (clientSocket) => {
+    clientSocket.setNoDelay(true);
+    clientSocket.setKeepAlive(true, 30000);
     const reqId = crypto.randomBytes(4).toString("hex");
     clientSocket.once("data", async (head) => {
       const headStr = head.toString();
@@ -368,8 +411,8 @@ function startChainRelay({ listen, upstreamUrl, upstreams, token, tokenHash, tls
       const preparedTarget = prepared.target;
 
       chainLog(`${reqId} ${preparedTarget.mode.toUpperCase()} ${preparedTarget.originalHost}:${preparedTarget.port} via ${preparedTarget.host}`);
-      for (const upstream of upstreamList) {
-        const ok = await tryChainUpstream(clientSocket, preparedHead, upstream, preparedTarget, reqId, timeoutMs);
+      for (let i = 0; i < upstreamList.length; i++) {
+        const ok = await tryChainUpstream(clientSocket, preparedHead, upstreamList[i], upstreamAuths[i], preparedTarget, reqId, timeoutMs);
         if (ok) return;
       }
       chainLog(`${reqId} all upstreams failed`);
