@@ -36,6 +36,10 @@ const CHAIN_PID_FILE = path.join(CONFIG_DIR, "chain.pid");
 const CHAIN_HEARTBEAT_FILE = path.join(CONFIG_DIR, "chain.heartbeat");
 const CHAIN_LOG_FILE = path.join(CONFIG_DIR, "chain.log");
 const CERT_DIR = path.join(CONFIG_DIR, "certs");
+const SPLIT_EDGE_PID_FILE = path.join(CONFIG_DIR, "split-edge.pid");
+const SPLIT_EDGE_HB_FILE = path.join(CONFIG_DIR, "split-edge.heartbeat");
+const SPLIT_LOCAL_PID_FILE = path.join(CONFIG_DIR, "split-local.pid");
+const SPLIT_LOCAL_HB_FILE = path.join(CONFIG_DIR, "split-local.heartbeat");
 const MAX_LOG_LINES = 500;
 
 let _logCount = 0;
@@ -565,6 +569,68 @@ function startSplitLocal(opts) {
   return server;
 }
 
+// ── split proxy: daemon management ─────────────────────────────────────────
+
+function isSplitEdgeRunning() {
+  try { process.kill(parseInt(fs.readFileSync(SPLIT_EDGE_PID_FILE, "utf8").trim(), 10), 0); return true; } catch { return false; }
+}
+function isSplitLocalRunning() {
+  try { process.kill(parseInt(fs.readFileSync(SPLIT_LOCAL_PID_FILE, "utf8").trim(), 10), 0); return true; } catch { return false; }
+}
+
+function runSplitEdgeDaemon() {
+  process.title = "codex-relay-split-edge";
+  const cfg = loadConfig();
+  const sc = cfg.split?.edge || {};
+  const listen = sc.listen || "127.0.0.1:9090";
+  process.on("uncaughtException", (e) => { try { fs.unlinkSync(SPLIT_EDGE_PID_FILE); } catch {} process.exit(1); });
+  const hbInterval = setInterval(() => { try { fs.writeFileSync(SPLIT_EDGE_HB_FILE, String(Date.now())); } catch {} }, 60000);
+  const server = startSplitEdge({ listen });
+  fs.writeFileSync(SPLIT_EDGE_PID_FILE, String(process.pid));
+  try { process.stdin.destroy(); } catch {}
+  try { process.stdout.destroy(); } catch {}
+  try { process.stderr.destroy(); } catch {}
+  try { fs.closeSync(0); } catch {}
+  try { fs.closeSync(1); } catch {}
+  try { fs.closeSync(2); } catch {}
+  const cleanup = () => {
+    clearInterval(hbInterval);
+    try { server.close(); } catch {}
+    try { fs.unlinkSync(SPLIT_EDGE_PID_FILE); } catch {}
+    try { fs.unlinkSync(SPLIT_EDGE_HB_FILE); } catch {}
+    process.exit(0);
+  };
+  process.on("SIGTERM", cleanup);
+  process.on("SIGINT", cleanup);
+}
+
+function runSplitLocalDaemon() {
+  process.title = "codex-relay-split-local";
+  const cfg = loadConfig();
+  const sc = cfg.split?.local || {};
+  const edgeAddr = parseListenAddr(sc.edge || "127.0.0.1:9090");
+  const listen = sc.listen || "127.0.0.1:8443";
+  process.on("uncaughtException", (e) => { try { fs.unlinkSync(SPLIT_LOCAL_PID_FILE); } catch {} process.exit(1); });
+  const hbInterval = setInterval(() => { try { fs.writeFileSync(SPLIT_LOCAL_HB_FILE, String(Date.now())); } catch {} }, 60000);
+  const server = startSplitLocal({ listen, edgeHost: edgeAddr.host, edgePort: edgeAddr.port });
+  fs.writeFileSync(SPLIT_LOCAL_PID_FILE, String(process.pid));
+  try { process.stdin.destroy(); } catch {}
+  try { process.stdout.destroy(); } catch {}
+  try { process.stderr.destroy(); } catch {}
+  try { fs.closeSync(0); } catch {}
+  try { fs.closeSync(1); } catch {}
+  try { fs.closeSync(2); } catch {}
+  const cleanup = () => {
+    clearInterval(hbInterval);
+    try { server.close(); } catch {}
+    try { fs.unlinkSync(SPLIT_LOCAL_PID_FILE); } catch {}
+    try { fs.unlinkSync(SPLIT_LOCAL_HB_FILE); } catch {}
+    process.exit(0);
+  };
+  process.on("SIGTERM", cleanup);
+  process.on("SIGINT", cleanup);
+}
+
 function startChainRelay({ listen, upstreamUrl, upstreams, token, tokenHash, tlsCert, tlsKey }) {
   const { host: listenHost, port: listenPort } = parseListenAddr(listen);
   const upstreamList = chainUpstreams(upstreams || upstreamUrl);
@@ -861,27 +927,104 @@ function cmdChain(args) {
   }
 }
 
-function cmdSplit(args) {
-  const action = args[0];
-  const opts = parseArgs(args.slice(1));
+function _splitDaemonStart(kind, spawnArgs) {
+  const checkFn = kind === "edge" ? isSplitEdgeRunning : isSplitLocalRunning;
+  const pidFile = kind === "edge" ? SPLIT_EDGE_PID_FILE : SPLIT_LOCAL_PID_FILE;
+  if (checkFn()) {
+    info(`split ${kind} already running (pid ${fs.readFileSync(pidFile, "utf8").trim()})`);
+    return;
+  }
+  const child = spawn(process.execPath, spawnArgs, { detached: true, stdio: ["ignore", "ignore", "pipe"] });
+  let errBuf = "";
+  child.stderr.on("data", (c) => { errBuf += c.toString(); });
+  child.unref();
+  for (let i = 0; i < 20; i++) {
+    if (checkFn()) break;
+    execSync("sleep 0.1", { stdio: "ignore" });
+  }
+  if (!checkFn()) die(`failed to start split ${kind} daemon${errBuf ? ":\n" + errBuf.trim() : ""}`);
+  info(`split ${kind} started (pid ${fs.readFileSync(pidFile, "utf8").trim()})`);
+}
 
-  switch (action) {
-    case "local": {
+function _splitDaemonStop(kind) {
+  const pidFile = kind === "edge" ? SPLIT_EDGE_PID_FILE : SPLIT_LOCAL_PID_FILE;
+  const hbFile = kind === "edge" ? SPLIT_EDGE_HB_FILE : SPLIT_LOCAL_HB_FILE;
+  const checkFn = kind === "edge" ? isSplitEdgeRunning : isSplitLocalRunning;
+  if (!checkFn()) { info(`split ${kind} not running.`); return; }
+  const pid = parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+  try { process.kill(pid, "SIGTERM"); } catch {}
+  try { fs.unlinkSync(pidFile); } catch {}
+  try { fs.unlinkSync(hbFile); } catch {}
+  info(`split ${kind} stopped.`);
+}
+
+function _splitDaemonStatus(kind) {
+  const pidFile = kind === "edge" ? SPLIT_EDGE_PID_FILE : SPLIT_LOCAL_PID_FILE;
+  const hbFile = kind === "edge" ? SPLIT_EDGE_HB_FILE : SPLIT_LOCAL_HB_FILE;
+  const checkFn = kind === "edge" ? isSplitEdgeRunning : isSplitLocalRunning;
+  if (!checkFn()) { console.log(`split ${kind}:  stopped`); return; }
+  const pid = fs.readFileSync(pidFile, "utf8").trim();
+  const hbAge = (() => {
+    try { return `${Math.round((Date.now() - parseInt(fs.readFileSync(hbFile, "utf8"), 10)) / 1000)}s ago`; }
+    catch { return "N/A"; }
+  })();
+  console.log(`split ${kind}:  running (pid ${pid})`);
+  console.log(`  heartbeat:   ${hbAge}`);
+}
+
+function cmdSplit(args) {
+  const role = args[0];
+  const action = args[1];
+  const opts = parseArgs(args.slice(role ? 1 : 0));  // shift args based on role presence
+
+  // ── edge subcommands ──
+  if (role === "edge") {
+    if (!action || action === "start") {
+      // Save config
+      const cfg = loadConfig();
+      cfg.split = cfg.split || {};
+      cfg.split.edge = { listen: opts.listen || cfg.split?.edge?.listen || "127.0.0.1:9090" };
+      saveConfig(cfg);
+      _splitDaemonStart("edge", [SCRIPT_PATH, "--_split-edge-daemon"]);
+      return;
+    }
+    if (action === "stop") { _splitDaemonStop("edge"); return; }
+    if (action === "status") { _splitDaemonStatus("edge"); return; }
+    if (action === "restart") { _splitDaemonStop("edge"); _splitDaemonStart("edge", [SCRIPT_PATH, "--_split-edge-daemon"]); return; }
+    // "run" or anything else = foreground
+    const listen = parseListenAddr(opts.listen || "127.0.0.1:9090");
+    startSplitEdge({ listen: `${listen.host}:${listen.port}` });
+    setInterval(() => {}, 60000);
+    return;
+  }
+
+  // ── local subcommands ──
+  if (role === "local") {
+    if (!action || action === "start") {
       const edge = opts.edge;
-      if (!edge) die("--edge <host:port> is required (the SSH-tunneled edge proxy address)");
-      const edgeAddr = parseListenAddr(edge);
-      const listen = parseListenAddr(opts.listen || "127.0.0.1:8443");
-      startSplitLocal({ listen: `${listen.host}:${listen.port}`, edgeHost: edgeAddr.host, edgePort: edgeAddr.port });
-      // Block forever
-      setInterval(() => {}, 60000);
-      break;
+      if (!edge) die("--edge <host:port> is required");
+      const cfg = loadConfig();
+      cfg.split = cfg.split || {};
+      cfg.split.local = { edge, listen: opts.listen || cfg.split?.local?.listen || "127.0.0.1:8443" };
+      saveConfig(cfg);
+      _splitDaemonStart("local", [SCRIPT_PATH, "--_split-local-daemon"]);
+      return;
     }
-    case "edge": {
-      const listen = parseListenAddr(opts.listen || "127.0.0.1:9090");
-      startSplitEdge({ listen: `${listen.host}:${listen.port}` });
-      setInterval(() => {}, 60000);
-      break;
-    }
+    if (action === "stop") { _splitDaemonStop("local"); return; }
+    if (action === "status") { _splitDaemonStatus("local"); return; }
+    if (action === "restart") { _splitDaemonStop("local"); _splitDaemonStart("local", [SCRIPT_PATH, "--_split-local-daemon"]); return; }
+    // "run" or anything else = foreground
+    const edge = opts.edge;
+    if (!edge) die("--edge <host:port> is required");
+    const edgeAddr = parseListenAddr(edge);
+    const listen = parseListenAddr(opts.listen || "127.0.0.1:8443");
+    startSplitLocal({ listen: `${listen.host}:${listen.port}`, edgeHost: edgeAddr.host, edgePort: edgeAddr.port });
+    setInterval(() => {}, 60000);
+    return;
+  }
+
+  // ── top-level subcommands ──
+  switch (role) {
     case "tunnel": {
       const host = opts.host;
       if (!host) die("--host <ssh-server> is required");
@@ -909,7 +1052,7 @@ function cmdSplit(args) {
       break;
     }
     default:
-      die(`usage: ${NAME} split {local|edge|tunnel|check}`);
+      die(`usage: ${NAME} split {edge|local} {start|stop|restart|status|run}  |  split {tunnel|check}`);
   }
 }
 
@@ -1323,8 +1466,9 @@ function printHelp() {
       --upstream http://proxy-a:8080,direct          - save chain relay config
     ${NAME} chain token generate                     - generate and save relay token
     ${NAME} chain start|stop|status|logs             - manage chain relay daemon
-    ${NAME} split local --edge 127.0.0.1:9090       - run local TLS-terminating proxy
-    ${NAME} split edge --listen 127.0.0.1:9090      - run VPS edge proxy
+    ${NAME} split edge start|stop|restart|status    - manage VPS edge daemon
+    ${NAME} split local start --edge 127.0.0.1:9090 - start local TLS daemon
+    ${NAME} split local stop|restart|status         - manage local proxy daemon
     ${NAME} split tunnel --host 1.2.3.4             - establish SSH tunnel to VPS
     ${NAME} split check [--edge 127.0.0.1:9090] [--url URL]  - diagnose split proxy chain
     ${NAME} install [--force]                        - install both codex-relay & codex CLI
@@ -1370,6 +1514,14 @@ async function main() {
   // Hidden: daemon mode
   if (raw[0] === "--_chain-daemon") {
     runChainDaemon();
+    return;
+  }
+  if (raw[0] === "--_split-edge-daemon") {
+    runSplitEdgeDaemon();
+    return;
+  }
+  if (raw[0] === "--_split-local-daemon") {
+    runSplitLocalDaemon();
     return;
   }
 

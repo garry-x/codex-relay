@@ -152,7 +152,7 @@ codex  ──→  本地 TLS 代理  ──[SSH 加密隧道]──→  VPS Edge
 scp codex-relay root@your-vps:/usr/local/bin/
 
 # 2. 在 VPS 上启动 edge proxy（监听 127.0.0.1，仅 SSH 隧道可访问）
-codex-relay split edge --listen 127.0.0.1:9090
+codex-relay split edge start
 ```
 
 Edge 代理维护到目标（如 api.openai.com）的 HTTPS 连接，所有 TLS 握手在同区域内完成。
@@ -166,8 +166,8 @@ codex-relay split tunnel --host your-vps
 # 等价于:
 # ssh -N -f -L 9090:127.0.0.1:9090 root@your-vps
 
-# 2. 启动本地 TLS 终止代理
-codex-relay split local --edge 127.0.0.1:9090
+# 2. 启动本地 TLS 终止代理（后台守护进程）
+codex-relay split local start --edge 127.0.0.1:9090
 
 # 首次运行自动生成本地 CA 证书，后续复用
 ```
@@ -180,7 +180,10 @@ codex-relay split local --edge 127.0.0.1:9090
 # 1. 配置代理指向本地 split proxy
 codex-relay proxy set http://127.0.0.1:8443
 
-# 2. 诊断验证
+# 2. 查看运行状态
+codex-relay split local status
+
+# 3. 诊断验证
 codex-relay split check
 
 # 3. 通过代理运行 codex
@@ -202,8 +205,10 @@ codex-relay run chat
 
 | 命令 | 用途 |
 |---|---|
-| `split edge --listen <host:port>` | 在 VPS 上启动 edge 代理（默认 127.0.0.1:9090） |
-| `split local --edge <host:port> [--listen <host:port>]` | 在本机启动本地 TLS 终止代理（默认 127.0.0.1:8443） |
+| `split edge start [--listen <host:port>]` | 后台启动 VPS edge 守护进程 |
+| `split edge stop / restart / status` | 管理 edge 守护进程 |
+| `split local start --edge <host:port> [--listen <host:port>]` | 后台启动本地 TLS 终止守护进程 |
+| `split local stop / restart / status` | 管理本地守护进程 |
 | `split tunnel --host <vps> [--user root] [--local-port 9090] [--remote-port 9090]` | 一键建立 SSH 隧道到 VPS |
 | `split check [--edge <host:port>] [--url URL] [--timeout S]` | 端到端诊断：CA 证书、edge 可达性、TLS 终止、完整链路 |
 
@@ -233,10 +238,10 @@ codex-relay
     chain status / logs                状态与日志
 
   Split 代理:
-    split edge --listen <host:port>    启动 VPS edge 代理
-    split local --edge <host:port>     启动本地 TLS 终止代理
-    split tunnel --host <vps>          建立 SSH 隧道
-    split check [--edge <host:port>]   端到端诊断
+    split edge start|stop|restart|status  管理 VPS edge 守护进程
+    split local start|stop|restart|status 管理本地 TLS 守护进程
+    split tunnel --host <vps>             建立 SSH 隧道
+    split check [--edge <host:port>]      端到端诊断
 
   通用:
     install [--force|--update]         安装 / 更新
