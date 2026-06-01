@@ -882,8 +882,30 @@ function cmdSplit(args) {
       setInterval(() => {}, 60000);
       break;
     }
+    case "tunnel": {
+      const host = opts.host;
+      if (!host) die("--host <ssh-server> is required");
+      const user = opts.user || "root";
+      const lport = opts["local-port"] || "9090";
+      const rport = opts["remote-port"] || "9090";
+      const keyArg = opts.key ? ["-i", opts.key] : [];
+      const args = [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ServerAliveInterval=60",
+        "-o", "ExitOnForwardFailure=yes",
+        "-N", "-f",
+        "-L", `${lport}:127.0.0.1:${rport}`,
+        ...keyArg,
+        `${user}@${host}`,
+      ];
+      info(`ssh tunnel: localhost:${lport} → ${host}:${rport}`);
+      const proc = spawn("ssh", args, { stdio: "inherit" });
+      proc.on("close", (code) => process.exit(code || 0));
+      proc.on("error", () => process.exit(1));
+      break;
+    }
     default:
-      die(`usage: ${NAME} split {local|edge}`);
+      die(`usage: ${NAME} split {local|edge|tunnel}`);
   }
 }
 
@@ -1214,6 +1236,7 @@ function printHelp() {
     ${NAME} chain start|stop|status|logs             - manage chain relay daemon
     ${NAME} split local --edge 127.0.0.1:9090       - run local TLS-terminating proxy
     ${NAME} split edge --listen 127.0.0.1:9090      - run VPS edge proxy
+    ${NAME} split tunnel --host 1.2.3.4             - establish SSH tunnel to VPS
     ${NAME} install [--force]                        - install both codex-relay & codex CLI
     ${NAME} install --update                         - update codex CLI
     ${NAME} install --version X                      - install specific codex version
@@ -1235,7 +1258,9 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--url" || argv[i] === "--timeout" || argv[i] === "--version" ||
         argv[i] === "--listen" || argv[i] === "--upstream" || argv[i] === "--token" ||
-        argv[i] === "--tls-cert" || argv[i] === "--tls-key" || argv[i] === "--edge") {
+        argv[i] === "--tls-cert" || argv[i] === "--tls-key" || argv[i] === "--edge" ||
+        argv[i] === "--host" || argv[i] === "--user" || argv[i] === "--local-port" ||
+        argv[i] === "--remote-port" || argv[i] === "--key") {
       opts[argv[i].replace(/^--/, "")] = argv[i + 1];
       i++;
     } else if (argv[i] === "--update") {
