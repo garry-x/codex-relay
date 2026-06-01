@@ -35,6 +35,7 @@ const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 const CHAIN_PID_FILE = path.join(CONFIG_DIR, "chain.pid");
 const CHAIN_HEARTBEAT_FILE = path.join(CONFIG_DIR, "chain.heartbeat");
 const CHAIN_LOG_FILE = path.join(CONFIG_DIR, "chain.log");
+const CERT_DIR = path.join(CONFIG_DIR, "certs");
 const MAX_LOG_LINES = 500;
 
 let _logCount = 0;
@@ -87,6 +88,81 @@ function tokenMatches(token, hash) {
   if (!hash) return false;
   if (hash.startsWith("sha256:")) return hashToken(token) === hash;
   return token === hash;
+}
+
+// ── split proxy: certificate management ────────────────────────────────────
+
+function shorthash(s) {
+  return crypto.createHash("sha256").update(s).digest("hex").slice(0, 16);
+}
+
+function ensureSplitCACert() {
+  fs.mkdirSync(CERT_DIR, { recursive: true });
+  const caKeyPath = path.join(CERT_DIR, "ca-key.pem");
+  const caCertPath = path.join(CERT_DIR, "ca-cert.pem");
+  if (fs.existsSync(caKeyPath) && fs.existsSync(caCertPath)) {
+    return { key: fs.readFileSync(caKeyPath, "utf8"), cert: fs.readFileSync(caCertPath, "utf8"), certPath: caCertPath };
+  }
+  if (!shutil("openssl")) die("openssl is required for split proxy mode. Install: apt install openssl");
+  execSync(
+    `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 ` +
+    `-days 3650 -nodes -keyout '${caKeyPath}' -out '${caCertPath}' ` +
+    `-subj '/CN=CodexRelayLocalCA' 2>/dev/null`,
+    { encoding: "utf8", timeout: 10000 }
+  );
+  // Verify generation
+  try { execSync(`openssl verify -CAfile '${caCertPath}' '${caCertPath}' 2>/dev/null`, { encoding: "utf8" }); } catch {
+    die("openssl CA cert generation failed — check openssl installation");
+  }
+  info(`split proxy CA generated at ${caCertPath}`);
+  return { key: fs.readFileSync(caKeyPath, "utf8"), cert: fs.readFileSync(caCertPath, "utf8"), certPath: caCertPath };
+}
+
+function getSplitDomainCert(hostname) {
+  const domainDir = path.join(CERT_DIR, shorthash(hostname));
+  const keyPath = path.join(domainDir, "key.pem");
+  const certPath = path.join(domainDir, "cert.pem");
+  if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
+    return { key: fs.readFileSync(keyPath, "utf8"), cert: fs.readFileSync(certPath, "utf8") };
+  }
+  fs.mkdirSync(domainDir, { recursive: true });
+  const ca = ensureSplitCACert();
+  // Write CA files to domain dir for openssl (needs file paths)
+  const caKeyPath = path.join(CERT_DIR, "ca-key.pem");
+  const caCertPath = path.join(CERT_DIR, "ca-cert.pem");
+  // Generate domain key
+  execSync(
+    `openssl ecparam -genkey -name prime256v1 -noout -out '${keyPath}' 2>/dev/null`,
+    { encoding: "utf8", timeout: 5000 }
+  );
+  // Generate CSR with SAN
+  const csrPath = path.join(domainDir, "domain.csr");
+  execSync(
+    `openssl req -new -key '${keyPath}' -out '${csrPath}' ` +
+    `-subj "/CN=${hostname}" -addext "subjectAltName=DNS:${hostname}" 2>/dev/null`,
+    { encoding: "utf8", timeout: 5000 }
+  );
+  // Sign with CA
+  execSync(
+    `openssl x509 -req -in '${csrPath}' ` +
+    `-CA '${caCertPath}' -CAkey '${caKeyPath}' -CAcreateserial ` +
+    `-out '${certPath}' -days 365 -sha256 ` +
+    `-extfile <(printf "subjectAltName=DNS:${hostname}\\n") 2>/dev/null`,
+    { encoding: "utf8", shell: "/bin/bash", timeout: 5000 }
+  );
+  // Clean up CSR
+  try { fs.unlinkSync(csrPath); } catch {}
+  return { key: fs.readFileSync(keyPath, "utf8"), cert: fs.readFileSync(certPath, "utf8") };
+}
+
+const _splitCtxCache = new Map();
+function getSplitSecureContext(hostname) {
+  let ctx = _splitCtxCache.get(hostname);
+  if (ctx) return ctx;
+  const { key, cert } = getSplitDomainCert(hostname);
+  ctx = tls.createSecureContext({ key, cert });
+  _splitCtxCache.set(hostname, ctx);
+  return ctx;
 }
 
 function findCodex() {
@@ -374,6 +450,119 @@ function tryChainUpstream(clientSocket, headStr, upstreamUrl, upstreamAuth, targ
     });
     clientSocket.once("error", () => { try { upstream.destroy(); } catch {} resolve(true); });
   });
+}
+
+// ── split proxy: edge server (VPS side) ────────────────────────────────────
+
+function handleSplitEdgeConnection(socket) {
+  socket.setNoDelay(true);
+  socket.setKeepAlive(true, 30000);
+  let buf = Buffer.alloc(0);
+  let targetSocket = null;
+
+  socket.on("data", (chunk) => {
+    if (targetSocket) {
+      targetSocket.write(chunk);
+      return;
+    }
+    buf = Buffer.concat([buf, chunk]);
+    const metaEnd = buf.indexOf("\r\n\r\n");
+    if (metaEnd === -1) return;
+    const metaStr = buf.toString("utf8", 0, metaEnd);
+    const m = metaStr.match(/^X-Target:\s*(.+):(\d+)\s*$/im);
+    if (!m) {
+      try { socket.write("HTTP/1.1 400 Bad Request\r\n\r\n"); socket.end(); } catch {}
+      return;
+    }
+    const host = m[1].trim();
+    const port = parseInt(m[2], 10);
+    const remaining = buf.slice(metaEnd + 4);
+    buf = null;
+    const tlsSock = tls.connect({ host, port, servername: host, rejectUnauthorized: false }, () => {
+      tlsSock.setNoDelay(true);
+      tlsSock.setKeepAlive(true, 30000);
+      targetSocket = tlsSock;
+      if (remaining.length > 0) tlsSock.write(remaining);
+      socket.pipe(tlsSock);
+      tlsSock.pipe(socket);
+      tlsSock.on("end", () => { try { socket.end(); } catch {} });
+    });
+    tlsSock.once("error", () => {
+      try { socket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"); socket.end(); } catch {}
+    });
+  });
+
+  socket.on("error", () => { try { targetSocket?.destroy(); } catch {} });
+  socket.on("end", () => { try { targetSocket?.end(); } catch {} });
+}
+
+function startSplitEdge(opts) {
+  const { host, port } = parseListenAddr(opts.listen || "127.0.0.1:9090");
+  const server = net.createServer(handleSplitEdgeConnection);
+  server.on("error", (e) => die(`split edge failed: ${e.message}`));
+  server.listen(port, host, () => {
+    info(`split edge listening on ${host}:${port}`);
+    info("no token auth — use SSH tunnel or firewall for security");
+  });
+  return server;
+}
+
+// ── split proxy: local server (client side) ────────────────────────────────
+
+function handleSplitLocalConnection(clientSocket, edgeHost, edgePort) {
+  clientSocket.setNoDelay(true);
+  clientSocket.once("data", (head) => {
+    const headStr = head.toString();
+    const target = connectTargetFromHead(headStr);
+    if (!target) {
+      try { clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n"); clientSocket.end(); } catch {}
+      return;
+    }
+    try {
+      const ctx = getSplitSecureContext(target.host);
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      const tlsSocket = new tls.TLSSocket(clientSocket, {
+        isServer: true,
+        secureContext: ctx,
+        ALPNProtocols: ["http/1.1"],
+      });
+      let pending = [];
+      tlsSocket.on("data", (d) => { pending.push(d); });
+      tlsSocket.once("error", () => { try { edgeSocket?.destroy(); } catch {} });
+
+      const meta = `X-Target: ${target.host}:${target.port}\r\n\r\n`;
+      const edgeSocket = net.connect(edgePort, edgeHost, () => {
+        edgeSocket.setNoDelay(true);
+        edgeSocket.setKeepAlive(true, 30000);
+        edgeSocket.write(meta);
+        // Flush buffered data from codex (arrived during TLS handshake)
+        for (const p of pending) edgeSocket.write(p);
+        pending = null;
+        tlsSocket.removeAllListeners("data");
+        tlsSocket.pipe(edgeSocket);
+        edgeSocket.pipe(tlsSocket);
+      });
+      edgeSocket.once("error", () => { try { tlsSocket.destroy(); } catch {} });
+    } catch (e) {
+      try { clientSocket.write("HTTP/1.1 500 Internal Server Error\r\n\r\n"); clientSocket.end(); } catch {}
+    }
+  });
+  clientSocket.on("error", () => {});
+}
+
+function startSplitLocal(opts) {
+  const { host, port } = parseListenAddr(opts.listen || "127.0.0.1:8443");
+  // Ensure CA certs exist before accepting connections
+  const ca = ensureSplitCACert();
+  info(`split local CA: ${ca.certPath}`);
+  info(`install CA cert on this machine: NODE_EXTRA_CA_CERTS=${ca.certPath}`);
+  const server = net.createServer((socket) => handleSplitLocalConnection(socket, opts.edgeHost, opts.edgePort));
+  server.on("error", (e) => die(`split local failed: ${e.message}`));
+  server.listen(port, host, () => {
+    info(`split local listening on ${host}:${port}`);
+    info(`edge: ${opts.edgeHost}:${opts.edgePort}`);
+  });
+  return server;
 }
 
 function startChainRelay({ listen, upstreamUrl, upstreams, token, tokenHash, tlsCert, tlsKey }) {
@@ -672,6 +861,32 @@ function cmdChain(args) {
   }
 }
 
+function cmdSplit(args) {
+  const action = args[0];
+  const opts = parseArgs(args.slice(1));
+
+  switch (action) {
+    case "local": {
+      const edge = opts.edge;
+      if (!edge) die("--edge <host:port> is required (the SSH-tunneled edge proxy address)");
+      const edgeAddr = parseListenAddr(edge);
+      const listen = parseListenAddr(opts.listen || "127.0.0.1:8443");
+      startSplitLocal({ listen: `${listen.host}:${listen.port}`, edgeHost: edgeAddr.host, edgePort: edgeAddr.port });
+      // Block forever
+      setInterval(() => {}, 60000);
+      break;
+    }
+    case "edge": {
+      const listen = parseListenAddr(opts.listen || "127.0.0.1:9090");
+      startSplitEdge({ listen: `${listen.host}:${listen.port}` });
+      setInterval(() => {}, 60000);
+      break;
+    }
+    default:
+      die(`usage: ${NAME} split {local|edge}`);
+  }
+}
+
 function cmdProxyCheck(opts = {}) {
   const testUrl = opts.url || "https://api.openai.com";
   const timeout = opts.timeout || 10;
@@ -955,6 +1170,12 @@ function cmdRun(args) {
     info(`using proxy: ${proxyUrl}`);
   }
 
+  // Split proxy mode: inject local CA cert so codex trusts TLS-terminated connections
+  const caCertPath = path.join(CERT_DIR, "ca-cert.pem");
+  if (proxyUrl && (proxyUrl.includes("127.0.0.1") || proxyUrl.includes("localhost")) && fs.existsSync(caCertPath)) {
+    env.NODE_EXTRA_CA_CERTS = caCertPath;
+  }
+
   const proc = spawn(codexBin, args, { env, stdio: "inherit" });
   proc.on("close", (code) => process.exit(code || 0));
   proc.on("error", () => process.exit(1));
@@ -963,9 +1184,11 @@ function cmdRun(args) {
 function printHelp() {
   console.log(`${NAME} — Node.js wrapper for OpenAI Codex CLI with proxy support.
 
-  Two proxy modes:
+  Three proxy modes:
     1. Direct:   codex → static proxy → target
     2. Chain:    codex → chain relay server → static proxy → target
+    3. Split:    codex → local TLS proxy → [SSH tunnel] → edge proxy → target
+                 (terminates TLS locally, eliminates cross-Pacific handshake)
 
   Commands:
     proxy      Configure proxy & test connectivity
@@ -989,6 +1212,8 @@ function printHelp() {
       --upstream http://proxy-a:8080,direct          - save chain relay config
     ${NAME} chain token generate                     - generate and save relay token
     ${NAME} chain start|stop|status|logs             - manage chain relay daemon
+    ${NAME} split local --edge 127.0.0.1:9090       - run local TLS-terminating proxy
+    ${NAME} split edge --listen 127.0.0.1:9090      - run VPS edge proxy
     ${NAME} install [--force]                        - install both codex-relay & codex CLI
     ${NAME} install --update                         - update codex CLI
     ${NAME} install --version X                      - install specific codex version
@@ -1010,7 +1235,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--url" || argv[i] === "--timeout" || argv[i] === "--version" ||
         argv[i] === "--listen" || argv[i] === "--upstream" || argv[i] === "--token" ||
-        argv[i] === "--tls-cert" || argv[i] === "--tls-key") {
+        argv[i] === "--tls-cert" || argv[i] === "--tls-key" || argv[i] === "--edge") {
       opts[argv[i].replace(/^--/, "")] = argv[i + 1];
       i++;
     } else if (argv[i] === "--update") {
@@ -1063,6 +1288,10 @@ async function main() {
 
     case "chain":
       cmdChain(args);
+      break;
+
+    case "split":
+      cmdSplit(args);
       break;
 
     case "install": {
