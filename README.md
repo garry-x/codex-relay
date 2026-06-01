@@ -1,6 +1,6 @@
 # codex-relay
 
-OpenAI Codex CLI 的代理包装器。提供两种代理模式，解决特定网络环境下 codex 无法直接访问 OpenAI API 的问题。
+OpenAI Codex CLI 的代理包装器。提供三种代理模式，解决特定网络环境下 codex 无法直接访问 OpenAI API 的问题。
 
 ## 安装
 
@@ -131,6 +131,90 @@ codex-relay run
 
 ---
 
+---
+## 模式三：Split 代理（低延迟跨区域中继）
+
+**适用场景**：本机与目标服务器之间网络延迟高（如跨太平洋），需要通过一台同区域 VPS 做 TLS 卸载，避免 TLS 握手在高延迟链路上多次往返。
+
+```
+codex  ──→  本地 TLS 代理  ──[SSH 加密隧道]──→  VPS Edge 代理  ──→  OpenAI
+              ↑ TLS 在本地完成 (0ms)                ↑ TLS 在同区域完成 (~80ms)
+```
+
+**核心原理**：模式二（链式中转）的 TLS 握手是端到端的（codex ↔ OpenAI），每个握手包都要跨洋往返 3 次（~700ms）。Split 模式把 TLS 拆成两段：本地段（localhost，0ms）+ VPS 段（同区域，~80ms），中间通过 SSH 隧道传输明文 HTTP。
+
+### 配置流程
+
+#### 第一步：在 VPS 上启动 Edge 代理
+
+```bash
+# 1. 把 codex-relay 复制到 VPS
+scp codex-relay root@your-vps:/usr/local/bin/
+
+# 2. 在 VPS 上启动 edge proxy（监听 127.0.0.1，仅 SSH 隧道可访问）
+codex-relay split edge --listen 127.0.0.1:9090
+```
+
+Edge 代理维护到目标（如 api.openai.com）的 HTTPS 连接，所有 TLS 握手在同区域内完成。
+
+#### 第二步：在本机建立 SSH 隧道并启动本地代理
+
+```bash
+# 1. 建立 SSH 隧道（或使用 split tunnel 命令）
+codex-relay split tunnel --host your-vps
+
+# 等价于:
+# ssh -N -f -L 9090:127.0.0.1:9090 root@your-vps
+
+# 2. 启动本地 TLS 终止代理
+codex-relay split local --edge 127.0.0.1:9090
+
+# 首次运行自动生成本地 CA 证书，后续复用
+```
+
+本地代理接收 codex 的 CONNECT 请求，在本地完成 TLS 握手（localhost，接近 0ms），将解密后的 HTTP 请求通过 SSH 隧道转发给 VPS edge。
+
+#### 第三步：配置并使用
+
+```bash
+# 1. 配置代理指向本地 split proxy
+codex-relay proxy set http://127.0.0.1:8443
+
+# 2. 诊断验证
+codex-relay split check
+
+# 3. 通过代理运行 codex
+codex-relay run chat
+```
+
+`codex-relay run` 会自动注入 `NODE_EXTRA_CA_CERTS` 让 codex 信任本地 CA 证书。
+
+### 延迟对比
+
+| 阶段 | 链式中转 (模式二) | Split 代理 (模式三) |
+|---|---|---|
+| TLS 握手 | 端到端跨洋 720-1887ms | localhost 3-5ms |
+| HTTP 请求/响应 | ~458ms (跨洋) | ~458ms (SSH 隧道) |
+| VPS → OpenAI TLS | — | ~82ms (同区域) |
+| **总计** | **~1600ms** | **~550ms** |
+
+### 涉及命令
+
+| 命令 | 用途 |
+|---|---|
+| `split edge --listen <host:port>` | 在 VPS 上启动 edge 代理（默认 127.0.0.1:9090） |
+| `split local --edge <host:port> [--listen <host:port>]` | 在本机启动本地 TLS 终止代理（默认 127.0.0.1:8443） |
+| `split tunnel --host <vps> [--user root] [--local-port 9090] [--remote-port 9090]` | 一键建立 SSH 隧道到 VPS |
+| `split check [--edge <host:port>] [--url URL] [--timeout S]` | 端到端诊断：CA 证书、edge 可达性、TLS 终止、完整链路 |
+
+### 架构安全
+
+- Edge 代理只监听 `127.0.0.1`，不暴露公网端口
+- SSH 隧道提供加密传输（本地 → VPS）
+- 本地 CA 私钥仅存在于本机 `~/.codex-relay/certs/`
+- TLS 证书按域名动态生成，缓存复用
+
+---
 ## 命令总览
 
 ```
@@ -147,6 +231,12 @@ codex-relay
     chain token generate               生成访问 token
     chain start / stop / restart       后台守护进程
     chain status / logs                状态与日志
+
+  Split 代理:
+    split edge --listen <host:port>    启动 VPS edge 代理
+    split local --edge <host:port>     启动本地 TLS 终止代理
+    split tunnel --host <vps>          建立 SSH 隧道
+    split check [--edge <host:port>]   端到端诊断
 
   通用:
     install [--force|--update]         安装 / 更新
@@ -183,5 +273,11 @@ codex-relay chat                        # 直接透传（效果相同）
 ├── config.json          # 代理配置 & 链式中转配置
 ├── chain.pid            # 链式中转 PID
 ├── chain.log            # 链式中转请求日志
-└── chain.heartbeat      # 链式中转心跳
+├── chain.heartbeat      # 链式中转心跳
+└── certs/               # Split 代理 CA 证书 & 域名证书缓存
+    ├── ca-key.pem
+    ├── ca-cert.pem
+    └── <hostname-sha>/
+        ├── key.pem
+        └── cert.pem
 ```

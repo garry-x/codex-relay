@@ -1,6 +1,6 @@
 # codex-relay 架构与原理
 
-## 两种代理模式
+## 三种代理模式
 
 ### 直连模式
 
@@ -36,6 +36,31 @@ codex → 链式中转服务器 → 静态代理 → OpenAI
 - 将请求转发给上游静态代理
 - **不修改请求目标、不做 DNS 解析、不做 TLS 解密**
 
+### Split 代理模式
+
+```
+codex → 本地 TLS 代理 → [SSH 隧道] → VPS Edge 代理 → OpenAI
+```
+
+将 TLS 握手拆为两段，避免高延迟链路上的多次往返：
+
+```
+┌─────────┐  HTTP_PROXY     ┌──────────────┐  明文 HTTP      ┌──────────────┐  HTTPS    ┌──────────┐
+│  Codex  │ ───────────────→ │ 本地 TLS 代理 │ ───[SSH 隧道]──→ │ VPS Edge 代理 │ ────────→ │ OpenAI   │
+│   CLI   │  localhost:8443  │ (TLS 终止)    │                  │ (连接池)       │           │ Servers  │
+└─────────┘                  └──────────────┘                   └──────────────┘           └──────────┘
+   TLS 握手:                       ↑                                ↑
+   localhost → localhost (0ms)     TLS 段1: 本地完成                TLS 段2: 同区域完成 (~80ms)
+```
+
+核心行为：
+- **本地代理**：接收 codex 的 CONNECT 请求，在本地完成 TLS 握手（localhost，0ms 延迟），解密 HTTP 流量
+- **SSH 隧道**：传输明文 HTTP（已从 TLS 解密），单次跨洋往返即可完成请求
+- **Edge 代理**：接收明文 HTTP，通过 HTTPS 连接池转发给 OpenAI（TLS 在同区域内完成，~80ms）
+- 动态证书生成：首次连接域名时通过 openssl 生成对应证书，后续缓存复用
+
+**延迟优势**：链式中转模式 TLS 握手需 3 次端到端跨洋往返（~700ms），Split 模式 TLS 在本地完成（~3ms）。
+
 ## 组件
 
 ### proxy — 代理配置与诊断
@@ -57,6 +82,31 @@ codex → 链式中转服务器 → 静态代理 → OpenAI
 - 多上游 fallback：按配置顺序尝试，任一成功即返回；未配置 `--upstream` 时自动复用 `proxy set` 的代理
 - `direct` 上游：跳过静态代理，中间服务器直连目标
 - TLS：支持 `--tls-cert` / `--tls-key` 加密客户端到中转服务器链路
+
+### split relay — Split 代理
+
+由两个协同进程组成：
+
+**本地代理** (`split local`)：
+- 监听 `127.0.0.1:8443`，作为 codex 的 HTTP 代理
+- TLS 终止：用动态生成的域名证书完成与 codex 的 TLS 握手
+- 通过 ALPN 强制 HTTP/1.1，简化转发
+- 将解密后的 HTTP 通过 SSH 隧道转发给 edge 代理
+- 首次运行自动生成 CA 证书（ECDSA P-256，10 年有效）
+
+**Edge 代理** (`split edge`)：
+- 监听 `127.0.0.1:9090`（仅 SSH 隧道可访问）
+- 解析 `X-Target: host:port` 元数据头
+- 建立到目标服务器的 TLS 连接（同区域，低延迟）
+- `NODE_EXTRA_CA_CERTS` 自动注入，codex 信任本地 CA
+
+**SSH 隧道** (`split tunnel`)：
+- 一键建立 `ssh -L local_port:127.0.0.1:remote_port user@host`
+- 默认端口 9090，可自定义
+
+**诊断** (`split check`)：
+- 验证 openssl、CA 证书、edge 可达性
+- 启动临时本地代理完成端到端连通性测试
 
 ## 请求流
 
@@ -82,6 +132,21 @@ codex 启动
   → 静态代理建立隧道，转发 TLS 流量
 ```
 
+### Split 代理模式
+
+```
+codex 启动
+  → codex-relay run 设置 HTTP_PROXY=http://127.0.0.1:8443, NODE_EXTRA_CA_CERTS=...
+  → codex 发送 CONNECT api.openai.com:443 到 127.0.0.1:8443
+  → 本地代理回复 200，启动 TLS 握手（本地完成，0ms）
+  → codex 发送 HTTPS 请求（已解密为明文 HTTP）
+  → 本地代理添加 X-Target: api.openai.com:443 元数据头
+  → 通过 SSH 隧道转发明文 HTTP 到 VPS edge:9090
+  → edge 代理解析目标地址，建立 TLS 连接（同区域 ~80ms）
+  → edge 代理转发 HTTP 请求并返回响应
+  → 响应沿原路返回：edge → SSH 隧道 → 本地代理 → TLS 加密 → codex
+```
+
 ## 配置文件
 
 ```
@@ -89,7 +154,13 @@ codex 启动
 ├── config.json          # 代理配置 & 链式中转配置
 ├── chain.pid            # 链式中转进程 PID
 ├── chain.log            # 链式中转请求日志
-└── chain.heartbeat      # 链式中转心跳时间戳
+├── chain.heartbeat      # 链式中转心跳时间戳
+└── certs/               # Split 代理 CA 证书 & 按域名缓存
+    ├── ca-key.pem
+    ├── ca-cert.pem
+    └── <hostname-sha>/
+        ├── key.pem
+        └── cert.pem
 ```
 
 ### config.json 结构
@@ -153,6 +224,26 @@ codex-relay proxy check
 codex-relay chain logs
 ```
 
+### split check 诊断
+
+```bash
+codex-relay split check
+```
+
+输出示例：
+
+```
+codex-relay split check
+
+  ✓ openssl (available)
+  ✓ CA certificate (/home/user/.codex-relay/certs/ca-cert.pem)
+  ✓ curl (available)
+  ✓ edge proxy (TCP 127.0.0.1:9090 open)
+  ✓ split proxy chain (HTTP 421, 779ms → https://api.openai.com)
+
+5 OK, 0 issues
+```
+
 ## 环境变量
 
 `run` 命令自动设置：
@@ -161,11 +252,14 @@ codex-relay chain logs
 |---|---|
 | `HTTP_PROXY` / `HTTPS_PROXY` | 配置的代理 URL |
 | `WS_PROXY` / `WSS_PROXY` | 配置的代理 URL |
+| `NODE_EXTRA_CA_CERTS` | Split 代理 CA 证书路径（自动注入，仅当 proxy 指向 127.0.0.1 时） |
 | `NO_PROXY` | `localhost,127.0.0.1,::1,.local` |
 
 ## 依赖
 
 - Node.js >= 18（零 npm 依赖，内置模块：`net`、`tls`、`fs`、`crypto`、`child_process`）
+- `openssl` — Split 代理证书生成
 - `curl` — 连通性测试
+- `ssh` — Split 代理隧道
 - npm — 安装 Codex CLI
 - macOS / Linux
