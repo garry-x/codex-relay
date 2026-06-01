@@ -904,8 +904,12 @@ function cmdSplit(args) {
       proc.on("error", () => process.exit(1));
       break;
     }
+    case "check": {
+      cmdSplitCheck(opts);
+      break;
+    }
     default:
-      die(`usage: ${NAME} split {local|edge|tunnel}`);
+      die(`usage: ${NAME} split {local|edge|tunnel|check}`);
   }
 }
 
@@ -973,6 +977,91 @@ function cmdProxyCheck(opts = {}) {
     for (const item of issues) {
       console.log(`  ✗ ${item}`);
     }
+  }
+  console.log("");
+  console.log(`${ok.length} OK, ${issues.length} issue${issues.length !== 1 ? "s" : ""}`);
+
+  if (issues.length > 0) process.exit(1);
+}
+
+function cmdSplitCheck(opts = {}) {
+  const testUrl = opts.url || "https://api.openai.com";
+  const timeout = opts.timeout || 10;
+  const edgeAddr = opts.edge || "127.0.0.1:9090";
+
+  const issues = [];
+  const ok = [];
+
+  const check = (label, condition, detail) => {
+    if (condition) ok.push(label + (detail ? ` (${detail})` : ""));
+    else issues.push(label + (detail ? ` — ${detail}` : ""));
+  };
+
+  // 1. openssl
+  const haveOpenssl = !!shutil("openssl");
+  check("openssl", haveOpenssl, haveOpenssl ? "available" : "not found — required for local TLS termination");
+
+  // 2. CA cert
+  const caCertPath = path.join(CERT_DIR, "ca-cert.pem");
+  const haveCACert = fs.existsSync(caCertPath);
+  check("CA certificate", haveCACert, haveCACert ? caCertPath : "not found — run: split local (generates on first start)");
+
+  // 3. curl
+  const haveCurl = !!shutil("curl");
+  check("curl", haveCurl, haveCurl ? "available" : "not found — required for connectivity test");
+
+  // 4. Edge proxy reachable
+  if (haveCurl) {
+    const { host: edgeHost, port: edgePort } = parseListenAddr(edgeAddr);
+    const edgeReachable = (() => {
+      try {
+        execSync(`timeout 2 bash -c 'echo >/dev/tcp/${edgeHost}/${edgePort}' 2>/dev/null`, { timeout: 3000 });
+        return true;
+      } catch { return false; }
+    })();
+    check("edge proxy", edgeReachable, `TCP ${edgeAddr}` + (edgeReachable ? " open" : " unreachable — check SSH tunnel or edge server"));
+
+    // 5. Full split proxy chain
+    if (edgeReachable && haveCACert && haveCurl) {
+      const tempListen = "127.0.0.1:18448";
+      const tempAddr = parseListenAddr(tempListen);
+      // Spawn a temporary local proxy as a subprocess (avoids event-loop blocking)
+      const tempProc = spawn(process.execPath, [SCRIPT_PATH, "split", "local", "--edge", edgeAddr, "--listen", tempListen], {
+        stdio: "ignore",
+        detached: true,
+      });
+      // Wait for it to start listening
+      for (let i = 0; i < 20; i++) {
+        execSync("sleep 0.1", { stdio: "ignore" });
+        try { const s = net.connect(tempAddr.port, tempAddr.host); s.destroy(); break; } catch {}
+      }
+      const start = Date.now();
+      try {
+        const out = execSync(
+          `curl -s -S -o /dev/null -w '%{http_code}' --cacert '${caCertPath}' --proxy 'http://${tempListen}' --connect-timeout ${timeout} --max-time ${timeout} '${testUrl}' 2>&1`,
+          { encoding: "utf8", timeout: (timeout + 5) * 1000 }
+        ).trim();
+        const latency = Date.now() - start;
+        const code = parseInt(out, 10);
+        check("split proxy chain", code >= 200 && code < 500, `HTTP ${out}, ${latency}ms → ${testUrl}`);
+      } catch (e) {
+        const latency = Date.now() - start;
+        const cause = e.stderr ? e.stderr.toString().trim().slice(0, 80) : (e.message || "").slice(0, 80);
+        check("split proxy chain", false, `failed after ${latency}ms: ${cause} → ${testUrl}`);
+      }
+      try { process.kill(tempProc.pid, "SIGTERM"); } catch {}
+    }
+  } else {
+    check("edge proxy", false, "curl not available");
+    check("split proxy chain", false, "curl not available");
+  }
+
+  // ── Results ──
+  console.log("codex-relay split check\n");
+  for (const item of ok) console.log(`  ✓ ${item}`);
+  if (issues.length > 0) {
+    console.log("");
+    for (const item of issues) console.log(`  ✗ ${item}`);
   }
   console.log("");
   console.log(`${ok.length} OK, ${issues.length} issue${issues.length !== 1 ? "s" : ""}`);
@@ -1237,6 +1326,7 @@ function printHelp() {
     ${NAME} split local --edge 127.0.0.1:9090       - run local TLS-terminating proxy
     ${NAME} split edge --listen 127.0.0.1:9090      - run VPS edge proxy
     ${NAME} split tunnel --host 1.2.3.4             - establish SSH tunnel to VPS
+    ${NAME} split check [--edge 127.0.0.1:9090] [--url URL]  - diagnose split proxy chain
     ${NAME} install [--force]                        - install both codex-relay & codex CLI
     ${NAME} install --update                         - update codex CLI
     ${NAME} install --version X                      - install specific codex version
