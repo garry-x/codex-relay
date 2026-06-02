@@ -1030,7 +1030,12 @@ function _ensureSshTunnel(host, edgePort, opts) {
       } catch (e2) {
         const msg2 = (e2.stderr || e2.stdout || e2.message || "").toString();
         if (msg2.includes("ddress already in use") || msg2.includes("bind")) {
-          die(`port ${edgePort} is in use by another process.\n  Run: fuser -v ${edgePort}/tcp  to see what is using it.\n  Then free it or use --edge with a different port.`);
+          let who = "";
+          try { who = execSync(`fuser -v ${edgePort}/tcp 2>&1`, { encoding: "utf8", timeout: 2000 }).trim(); } catch {}
+          if (!who) {
+            try { who = execSync(`ss -tlnp 'sport = :${edgePort}' 2>&1`, { encoding: "utf8", timeout: 2000 }).trim(); } catch {}
+          }
+          die(`port ${edgePort} is in use by another process:\n${who || "  (try: sudo fuser -v " + edgePort + "/tcp)"}\n  Free it (sudo fuser -k ${edgePort}/tcp) or use --edge with a different port.`);
         }
         die(`ssh tunnel failed: ${msg2.trim()}`);
       }
