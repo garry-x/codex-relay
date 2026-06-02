@@ -47,7 +47,7 @@ codex → 本地 TLS 代理 → [SSH 隧道] → VPS Edge 代理 → OpenAI
 ```
 ┌─────────┐  HTTP_PROXY     ┌──────────────┐  明文 HTTP      ┌──────────────┐  HTTPS    ┌──────────┐
 │  Codex  │ ───────────────→ │ 本地 TLS 代理 │ ───[SSH 隧道]──→ │ VPS Edge 代理 │ ────────→ │ OpenAI   │
-│   CLI   │  localhost:8443  │ (TLS 终止)    │                  │ (连接池)       │           │ Servers  │
+│   CLI   │ localhost:18443  │ (TLS 终止)    │                  │ (连接池)       │           │ Servers  │
 └─────────┘                  └──────────────┘                   └──────────────┘           └──────────┘
    TLS 握手:                       ↑                                ↑
    localhost → localhost (0ms)     TLS 段1: 本地完成                TLS 段2: 同区域完成 (~80ms)
@@ -88,21 +88,21 @@ codex → 本地 TLS 代理 → [SSH 隧道] → VPS Edge 代理 → OpenAI
 由两个协同进程组成：
 
 **本地代理** (`split local`)：
-- 监听 `127.0.0.1:8443`，作为 codex 的 HTTP 代理
+- 监听 `127.0.0.1:18443`，作为 codex 的 HTTP 代理
 - TLS 终止：用动态生成的域名证书完成与 codex 的 TLS 握手
 - 通过 ALPN 强制 HTTP/1.1，简化转发
 - 将解密后的 HTTP 通过 SSH 隧道转发给 edge 代理
 - 首次运行自动生成 CA 证书（ECDSA P-256，10 年有效）
 
 **Edge 代理** (`split edge`)：
-- 监听 `127.0.0.1:9090`（仅 SSH 隧道可访问）
+- 监听 `127.0.0.1:19090`（仅 SSH 隧道可访问）
 - 解析 `X-Target: host:port` 元数据头
 - 建立到目标服务器的 TLS 连接（同区域，低延迟）
 - `NODE_EXTRA_CA_CERTS` 自动注入，codex 信任本地 CA
 
-**SSH 隧道** (`split tunnel`)：
-- 一键建立 `ssh -L local_port:127.0.0.1:remote_port user@host`
-- 默认端口 9090，可自定义
+**SSH 隧道**：
+- `split local start --host <vps>` 自动建立，PID 追踪，优雅退出时清理
+- 默认端口 19090，可自定义（同 edge 端口）
 
 **诊断** (`split check`)：
 - 验证 openssl、CA 证书、edge 可达性
@@ -136,12 +136,12 @@ codex 启动
 
 ```
 codex 启动
-  → codex-relay run 设置 HTTP_PROXY=http://127.0.0.1:8443, NODE_EXTRA_CA_CERTS=...
-  → codex 发送 CONNECT api.openai.com:443 到 127.0.0.1:8443
+  → codex-relay run 设置 HTTP_PROXY=http://127.0.0.1:18443, NODE_EXTRA_CA_CERTS=...
+  → codex 发送 CONNECT api.openai.com:443 到 127.0.0.1:18443
   → 本地代理回复 200，启动 TLS 握手（本地完成，0ms）
   → codex 发送 HTTPS 请求（已解密为明文 HTTP）
   → 本地代理添加 X-Target: api.openai.com:443 元数据头
-  → 通过 SSH 隧道转发明文 HTTP 到 VPS edge:9090
+  → 通过 SSH 隧道转发明文 HTTP 到 VPS edge:19090
   → edge 代理解析目标地址，建立 TLS 连接（同区域 ~80ms）
   → edge 代理转发 HTTP 请求并返回响应
   → 响应沿原路返回：edge → SSH 隧道 → 本地代理 → TLS 加密 → codex
@@ -238,7 +238,7 @@ codex-relay split check
   ✓ openssl (available)
   ✓ CA certificate (/home/user/.codex-relay/certs/ca-cert.pem)
   ✓ curl (available)
-  ✓ edge proxy (TCP 127.0.0.1:9090 open)
+  ✓ edge proxy (TCP 127.0.0.1:19090 open)
   ✓ split proxy chain (HTTP 421, 779ms → https://api.openai.com)
 
 5 OK, 0 issues

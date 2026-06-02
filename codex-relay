@@ -502,7 +502,7 @@ function handleSplitEdgeConnection(socket) {
 }
 
 function startSplitEdge(opts) {
-  const { host, port } = parseListenAddr(opts.listen || "127.0.0.1:9090");
+  const { host, port } = parseListenAddr(opts.listen || "127.0.0.1:19090");
   const server = net.createServer(handleSplitEdgeConnection);
   server.on("error", (e) => die(`split edge failed: ${e.message}`));
   server.listen(port, host, () => {
@@ -556,7 +556,7 @@ function handleSplitLocalConnection(clientSocket, edgeHost, edgePort) {
 }
 
 function startSplitLocal(opts) {
-  const { host, port } = parseListenAddr(opts.listen || "127.0.0.1:8443");
+  const { host, port } = parseListenAddr(opts.listen || "127.0.0.1:18443");
   // Ensure CA certs exist before accepting connections
   const ca = ensureSplitCACert();
   info(`split local CA: ${ca.certPath}`);
@@ -583,7 +583,7 @@ function runSplitEdgeDaemon() {
   process.title = "codex-relay-split-edge";
   const cfg = loadConfig();
   const sc = cfg.split?.edge || {};
-  const listen = sc.listen || "127.0.0.1:9090";
+  const listen = sc.listen || "127.0.0.1:19090";
   process.on("uncaughtException", (e) => { try { fs.unlinkSync(SPLIT_EDGE_PID_FILE); } catch {} process.exit(1); });
   const hbInterval = setInterval(() => { try { fs.writeFileSync(SPLIT_EDGE_HB_FILE, String(Date.now())); } catch {} }, 60000);
   const server = startSplitEdge({ listen });
@@ -609,8 +609,8 @@ function runSplitLocalDaemon() {
   process.title = "codex-relay-split-local";
   const cfg = loadConfig();
   const sc = cfg.split?.local || {};
-  const edgeAddr = parseListenAddr(sc.edge || "127.0.0.1:9090");
-  const listen = sc.listen || "127.0.0.1:8443";
+  const edgeAddr = parseListenAddr(sc.edge || "127.0.0.1:19090");
+  const listen = sc.listen || "127.0.0.1:18443";
   process.on("uncaughtException", (e) => { try { fs.unlinkSync(SPLIT_LOCAL_PID_FILE); } catch {} process.exit(1); });
   const hbInterval = setInterval(() => { try { fs.writeFileSync(SPLIT_LOCAL_HB_FILE, String(Date.now())); } catch {} }, 60000);
   const server = startSplitLocal({ listen, edgeHost: edgeAddr.host, edgePort: edgeAddr.port });
@@ -1071,7 +1071,7 @@ function cmdSplit(args) {
       // Save config
       const cfg = loadConfig();
       cfg.split = cfg.split || {};
-      cfg.split.edge = { listen: opts.listen || cfg.split?.edge?.listen || "127.0.0.1:9090" };
+      cfg.split.edge = { listen: opts.listen || cfg.split?.edge?.listen || "127.0.0.1:19090" };
       saveConfig(cfg);
       _splitDaemonStart("edge", [SCRIPT_PATH, "--_split-edge-daemon"]);
       return;
@@ -1080,7 +1080,7 @@ function cmdSplit(args) {
     if (action === "status") { _splitDaemonStatus("edge"); return; }
     if (action === "restart") { _splitDaemonStop("edge"); _splitDaemonStart("edge", [SCRIPT_PATH, "--_split-edge-daemon"]); return; }
     // "run" or anything else = foreground
-    const listen = parseListenAddr(opts.listen || "127.0.0.1:9090");
+    const listen = parseListenAddr(opts.listen || "127.0.0.1:19090");
     const edgeServer = startSplitEdge({ listen: `${listen.host}:${listen.port}` });
     const edgeCleanup = () => { try { edgeServer.close(); } catch {} process.exit(0); };
     process.on("SIGINT", edgeCleanup);
@@ -1101,7 +1101,7 @@ function cmdSplit(args) {
       }
       const cfg = loadConfig();
       cfg.split = cfg.split || {};
-      cfg.split.local = { edge, listen: opts.listen || cfg.split?.local?.listen || "127.0.0.1:8443" };
+      cfg.split.local = { edge, listen: opts.listen || cfg.split?.local?.listen || "127.0.0.1:18443" };
       if (opts.host) cfg.split.local.host = opts.host;
       if (opts.user) cfg.split.local.user = opts.user;
       if (opts.key) cfg.split.local.key = opts.key;
@@ -1119,7 +1119,7 @@ function cmdSplit(args) {
     if (opts.host && (edgeAddr.host === "127.0.0.1" || edgeAddr.host === "localhost")) {
       _ensureSshTunnel(opts.host, edgeAddr.port, opts);
     }
-    const listen = parseListenAddr(opts.listen || "127.0.0.1:8443");
+    const listen = parseListenAddr(opts.listen || "127.0.0.1:18443");
     const localServer = startSplitLocal({ listen: `${listen.host}:${listen.port}`, edgeHost: edgeAddr.host, edgePort: edgeAddr.port });
     const localCleanup = () => { try { localServer.close(); } catch {} _cleanupSplitTunnel(); process.exit(0); };
     process.on("SIGINT", localCleanup);
@@ -1213,7 +1213,7 @@ function cmdProxyCheck(opts = {}) {
 function cmdSplitCheck(opts = {}) {
   const testUrl = opts.url || "https://api.openai.com";
   const timeout = opts.timeout || 10;
-  const edgeAddr = opts.edge || "127.0.0.1:9090";
+  const edgeAddr = opts.edge || "127.0.0.1:19090";
 
   const issues = [];
   const ok = [];
@@ -1550,9 +1550,9 @@ function printHelp() {
     ${NAME} chain token generate                     - generate and save relay token
     ${NAME} chain start|stop|status|logs             - manage chain relay daemon
     ${NAME} split edge start|stop|restart|status    - manage VPS edge daemon
-    ${NAME} split local start --edge 127.0.0.1:9090 [--host HOST]  - start local TLS daemon (auto SSH tunnel)
+    ${NAME} split local start --edge 127.0.0.1:19090 [--host HOST]  - start local TLS daemon (auto SSH tunnel)
     ${NAME} split local stop|restart|status         - manage local proxy daemon
-    ${NAME} split check [--edge 127.0.0.1:9090] [--url URL]  - diagnose split proxy chain
+    ${NAME} split check [--edge 127.0.0.1:19090] [--url URL]  - diagnose split proxy chain
     ${NAME} install [--force]                        - install both codex-relay & codex CLI
     ${NAME} install --update                         - update codex CLI
     ${NAME} install --version X                      - install specific codex version

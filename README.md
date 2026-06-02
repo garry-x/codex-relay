@@ -92,7 +92,7 @@ codex-relay chain status
 
 ```bash
 codex-relay chain config \
-  --listen 0.0.0.0:8443 \
+  --listen 0.0.0.0:18443 \
   --upstream http://user:pass@static-proxy:8080,direct \
   --tls-cert /etc/codex-relay/fullchain.pem \
   --tls-key /etc/codex-relay/privkey.pem
@@ -109,7 +109,7 @@ codex-relay chain restart
 codex-relay proxy set http://<TOKEN>@relay.example.com:8080
 
 # 如果中间服务器启用了 TLS：
-codex-relay proxy set https://<TOKEN>@relay.example.com:8443
+codex-relay proxy set https://<TOKEN>@relay.example.com:18443
 
 # 3. 验证连通性
 codex-relay proxy check
@@ -161,7 +161,7 @@ Edge 代理维护到目标（如 api.openai.com）的 HTTPS 连接，所有 TLS 
 
 ```bash
 # 一条命令：自动建立 SSH 隧道 + 启动本地 TLS 代理
-codex-relay split local start --edge 127.0.0.1:9090 --host your-vps
+codex-relay split local start --edge 127.0.0.1:119090 --host your-vps
 
 # 首次运行自动生成本地 CA 证书，后续复用
 # --host 触发自动 SSH 隧道，隧道 PID 记录到 ~/.codex-relay/split-tunnel.pid
@@ -173,15 +173,15 @@ codex-relay split local start --edge 127.0.0.1:9090 --host your-vps
 **手动 SSH 隧道**（可选，不使用 `--host` 时）：
 
 ```bash
-ssh -N -f -L 9090:127.0.0.1:9090 root@your-vps
-codex-relay split local start --edge 127.0.0.1:9090
+ssh -N -f -L 19090:127.0.0.1:119090 root@your-vps
+codex-relay split local start --edge 127.0.0.1:119090
 ```
 
 #### 第三步：配置并使用
 
 ```bash
 # 1. 配置代理指向本地 split proxy
-codex-relay proxy set http://127.0.0.1:8443
+codex-relay proxy set http://127.0.0.1:118443
 
 # 2. 查看运行状态
 codex-relay split local status
