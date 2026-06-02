@@ -257,7 +257,67 @@ function connectTargetFromHead(headStr) {
 
 // ── split proxy: edge server (VPS side) ────────────────────────────────────
 
-function handleSplitEdgeConnection(socket) {
+// Parse proxy URL for edge upstream: http://[user:pass@]host:port
+function _parseEdgeProxy(url) {
+  if (!url) return null;
+  const s = String(url).replace(/^https?:\/\//, "");
+  const atIdx = s.lastIndexOf("@");
+  const auth = atIdx >= 0 ? s.slice(0, atIdx) : "";
+  const hp = atIdx >= 0 ? s.slice(atIdx + 1) : s;
+  const ci = hp.lastIndexOf(":");
+  const host = ci >= 0 ? hp.slice(0, ci) : hp;
+  const port = ci >= 0 ? parseInt(hp.slice(ci + 1), 10) : 80;
+  const uc = auth.indexOf(":");
+  const user = uc >= 0 ? auth.slice(0, uc) : auth;
+  const pass = uc >= 0 ? auth.slice(uc + 1) : "";
+  return { host, port, user, pass, auth: user ? Buffer.from(`${user}:${pass}`).toString("base64") : "" };
+}
+
+// Connect to target through an upstream HTTP proxy (CONNECT tunnel), then TLS
+function _edgeConnectViaProxy(targetHost, targetPort, proxy, callback) {
+  const sock = net.connect(proxy.port, proxy.host);
+  sock.setNoDelay(true);
+  sock.once("connect", () => {
+    let head = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n`;
+    if (proxy.auth) head += `Proxy-Authorization: Basic ${proxy.auth}\r\n`;
+    head += "\r\n";
+    sock.write(head);
+    let respBuf = Buffer.alloc(0);
+    const onData = (d) => {
+      respBuf = Buffer.concat([respBuf, d]);
+      const end = respBuf.indexOf("\r\n\r\n");
+      if (end < 0) return; // wait for complete header
+      sock.removeListener("data", onData);
+      const status = respBuf.toString("utf8", 0, end).split("\r\n")[0];
+      if (!status.includes("200")) {
+        _splitLog("edge", `proxy rejected CONNECT: ${status}`);
+        try { sock.destroy(); } catch {}
+        return;
+      }
+      _splitLog("edge", `proxy CONNECT OK: ${status}`);
+      const leftover = respBuf.slice(end + 4);
+      const tlsSock = tls.connect({
+        socket: sock,
+        servername: targetHost,
+        rejectUnauthorized: false,
+        ALPNProtocols: ["http/1.1"],
+      }, () => {
+        _splitLog("edge", `TLS established to ${targetHost}`);
+        if (leftover.length > 0) tlsSock.unshift(leftover);
+        callback(tlsSock);
+      });
+      tlsSock.once("error", (e) => { _splitLog("edge", `TLS error: ${e.message}`); });
+    };
+    sock.on("data", onData);
+  });
+  sock.once("error", (e) => { _splitLog("edge", `proxy socket error: ${e.message}`); });
+  sock.once("connect", () => {
+    _splitLog("edge", `proxy socket connected to ${proxy.host}:${proxy.port}`);
+  });
+  return sock;
+}
+
+function handleSplitEdgeConnection(socket, proxyUrl) {
   socket.setNoDelay(true);
   socket.setKeepAlive(true, 30000);
   let buf = Buffer.alloc(0);
@@ -281,7 +341,28 @@ function handleSplitEdgeConnection(socket) {
     const port = parseInt(m[2], 10);
     const remaining = buf.slice(metaEnd + 4);
     buf = null;
-    const tlsSock = tls.connect({ host, port, servername: host, rejectUnauthorized: false }, () => {
+
+    const proxy = _parseEdgeProxy(proxyUrl);
+    if (proxy) {
+      // Connect through upstream static proxy
+      _splitLog("edge", `proxy connect to ${host}:${port} via ${proxyUrl}`);
+      const proxySock = _edgeConnectViaProxy(host, port, proxy, (tlsSock) => {
+        tlsSock.setNoDelay(true);
+        tlsSock.setKeepAlive(true, 30000);
+        targetSocket = tlsSock;
+        if (remaining.length > 0) tlsSock.write(remaining);
+        socket.pipe(tlsSock);
+        tlsSock.pipe(socket);
+        tlsSock.on("end", () => { try { socket.end(); } catch {} });
+      });
+      proxySock.once("error", () => {
+        try { socket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"); socket.end(); } catch {}
+      });
+      return;
+    }
+
+    // Direct TLS connection (no proxy)
+    const tlsSock = tls.connect({ host, port, servername: host, rejectUnauthorized: false, ALPNProtocols: ["http/1.1"] }, () => {
       tlsSock.setNoDelay(true);
       tlsSock.setKeepAlive(true, 30000);
       targetSocket = tlsSock;
@@ -301,10 +382,11 @@ function handleSplitEdgeConnection(socket) {
 
 function startSplitEdge(opts) {
   const { host, port } = parseListenAddr(opts.listen || "127.0.0.1:19090");
-  const server = net.createServer(handleSplitEdgeConnection);
+  const proxyUrl = opts.proxyUrl || "";
+  const server = net.createServer((socket) => handleSplitEdgeConnection(socket, proxyUrl));
   server.on("error", (e) => die(`split edge failed: ${e.message}`));
   server.listen(port, host, () => {
-    info(`split edge listening on ${host}:${port}`);
+    info(`split edge listening on ${host}:${port}${proxyUrl ? ` (upstream: ${proxyUrl})` : ""}`);
     info("no token auth — use SSH tunnel or firewall for security");
   });
   return server;
@@ -381,10 +463,11 @@ function runSplitEdgeDaemon() {
   process.title = "codex-relay-split-edge";
   const cfg = loadConfig();
   const listen = cfg.split?.edge_listen || "127.0.0.1:19090";
-  _splitLog("edge", `daemon starting on ${listen}`);
+  const proxyUrl = cfg.split?.edge_proxy || "";
+  _splitLog("edge", `daemon starting on ${listen}${proxyUrl ? `, upstream: ${proxyUrl}` : ""}`);
   process.on("uncaughtException", (e) => { _splitLog("edge", `CRASH: ${e.message}`); try { fs.unlinkSync(SPLIT_EDGE_PID_FILE); } catch {} process.exit(1); });
   const hbInterval = setInterval(() => { try { fs.writeFileSync(SPLIT_EDGE_HB_FILE, String(Date.now())); } catch {} }, 60000);
-  const server = startSplitEdge({ listen });
+  const server = startSplitEdge({ listen, proxyUrl });
   fs.writeFileSync(SPLIT_EDGE_PID_FILE, String(process.pid));
   try { process.stdin.destroy(); } catch {}
   try { process.stdout.destroy(); } catch {}
@@ -623,6 +706,33 @@ function _ensureSshTunnel(sshTarget, edgePort, sshKey) {
   throw new Error(`SSH tunnel not reachable on port ${edgePort} after 3s`);
 }
 
+function _ensureRemoteEdge(sshTarget, sshKey) {
+  if (!shutil("ssh")) { info("ssh not found — skip remote edge start"); return; }
+
+  const keyArg = sshKey ? ["-i", sshKey] : [];
+  const { user, host } = _parseSsh(sshTarget);
+  const dest = `${user}@${host}`;
+
+  // Quick check: is edge already running on remote?
+  try {
+    const out = execSync(`ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${dest}' "codex-relay split status 2>&1 || true"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" });
+    if (out.includes("split edge:  running")) {
+      info(`remote edge already running on ${host}`);
+      return;
+    }
+  } catch {}
+
+  // Start edge on remote (auto-detects edge mode: no SSH config → edge)
+  info(`starting remote edge on ${host}...`);
+  try {
+    const out = execSync(`ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${dest}' "codex-relay split start 2>&1"`, { encoding: "utf8", timeout: 15000, stdio: "pipe" });
+    info(out.trim());
+  } catch (e) {
+    const msg = (e.stderr || e.stdout || e.message || "").toString().trim();
+    info(`remote edge start: ${msg || "failed — run manually on ${host}: codex-relay split start"}`);
+  }
+}
+
 function cmdSplitLogs() {
   let found = false;
   for (const kind of ["local", "edge"]) {
@@ -643,55 +753,72 @@ function cmdSplit(args) {
   const action = args[0];
   const opts = parseArgs(args.slice(1));
 
+  // Resolve SSH target: first positional arg containing @
+  const sshTarget = opts._.find(a => a.includes("@")) || "";
+
   switch (action) {
     case "start": {
-      const isEdge = opts.edge;
-      const hasSsh = opts.ssh;
-
-      if (isEdge) {
-        // Edge mode: listen on this machine for incoming local proxies
-        const cfg = loadConfig();
-        const listen = opts.listen || cfg.split?.edge_listen || "127.0.0.1:19090";
-        cfg.split = cfg.split || {};
-        cfg.split.edge_listen = listen;
-        saveConfig(cfg);
-        _splitDaemonStart("edge", [SCRIPT_PATH, "--_split-edge-daemon"]);
-        return;
-      }
-
-      if (hasSsh) {
-        // Local mode: start local proxy with SSH tunnel to VPS edge
+      if (sshTarget) {
+        // Local mode: start local proxy with SSH tunnel + remote edge
         const cfg = loadConfig();
         cfg.split = cfg.split || {};
-        cfg.split.ssh = hasSsh;
+        cfg.split.ssh = sshTarget;
         if (opts["ssh-key"]) cfg.split.ssh_key = opts["ssh-key"];
         if (opts.listen) cfg.split.local_listen = opts.listen;
+        // Auto-set proxy to local split proxy so codex-relay run just works
+        const localListen = cfg.split.local_listen || "127.0.0.1:18443";
+        cfg.http = `http://${localListen}`;
+        cfg.https = `http://${localListen}`;
         saveConfig(cfg);
         const edgePort = parseListenAddr(cfg.split.edge_listen || "127.0.0.1:19090").port;
-        try { _ensureSshTunnel(hasSsh, edgePort, opts["ssh-key"]); }
+        try { _ensureSshTunnel(sshTarget, edgePort, opts["ssh-key"]); }
         catch (e) { die(e.message); }
         _splitDaemonStart("local", [SCRIPT_PATH, "--_split-local-daemon"]);
+        _ensureRemoteEdge(sshTarget, opts["ssh-key"]);
         return;
       }
 
-      // No flags: try saved config
+      // Auto-detect from saved config
       const cfg = loadConfig();
       if (cfg.split?.ssh) {
-        // Auto-start local with saved SSH config
+        // Saved SSH → local mode
+        const localListen = cfg.split.local_listen || "127.0.0.1:18443";
+        cfg.http = `http://${localListen}`;
+        cfg.https = `http://${localListen}`;
+        saveConfig(cfg);
         const edgePort = parseListenAddr(cfg.split.edge_listen || "127.0.0.1:19090").port;
         try { _ensureSshTunnel(cfg.split.ssh, edgePort, cfg.split.ssh_key); }
         catch (e) { die(e.message); }
         _splitDaemonStart("local", [SCRIPT_PATH, "--_split-local-daemon"]);
+        _ensureRemoteEdge(cfg.split.ssh, cfg.split.ssh_key);
         return;
       }
-      die(`usage: ${NAME} split start [--edge] [--ssh user@host] [--listen addr]\n` +
-          `  --edge             start VPS edge daemon\n` +
-          `  --ssh user@host    start local daemon with SSH tunnel`);
+
+      // No SSH config → edge mode (this machine is the VPS)
+      const listen = opts.listen || cfg.split?.edge_listen || "127.0.0.1:19090";
+      cfg.split = cfg.split || {};
+      cfg.split.edge_listen = listen;
+      // If proxy was set (for edge upstream), save to edge_proxy
+      if (cfg.http) { cfg.split.edge_proxy = cfg.http; delete cfg.http; delete cfg.https; }
+      saveConfig(cfg);
+      _splitDaemonStart("edge", [SCRIPT_PATH, "--_split-edge-daemon"]);
+      return;
     }
 
     case "stop":
       _splitDaemonStop("local");
       _splitDaemonStop("edge");
+      // Also stop remote edge via SSH
+      try {
+        const cfg = loadConfig();
+        if (cfg.split?.ssh) {
+          const keyArg = cfg.split.ssh_key ? ["-i", cfg.split.ssh_key] : [];
+          const { user, host } = _parseSsh(cfg.split.ssh);
+          try {
+            execSync(`ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${user}@${host}' "codex-relay split stop 2>&1 || true"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" });
+          } catch {}
+        }
+      } catch {}
       break;
 
     case "status":
@@ -794,7 +921,8 @@ function cmdProxyCheck(opts = {}) {
 function cmdSplitCheck(opts = {}) {
   const testUrl = opts.url || "https://api.openai.com";
   const timeout = opts.timeout || 10;
-  const edgeAddr = opts.edge || "127.0.0.1:19090";
+  const cfg = loadConfig();
+  const edgeAddr = cfg.split?.edge_listen || "127.0.0.1:19090";
 
   const issues = [];
   const ok = [];
@@ -811,7 +939,7 @@ function cmdSplitCheck(opts = {}) {
   // 2. CA cert
   const caCertPath = path.join(CERT_DIR, "ca-cert.pem");
   const haveCACert = fs.existsSync(caCertPath);
-  check("CA certificate", haveCACert, haveCACert ? caCertPath : "not found — run: split local (generates on first start)");
+  check("CA certificate", haveCACert, haveCACert ? caCertPath : "not found — run: split start (generates on first start)");
 
   // 3. curl
   const haveCurl = !!shutil("curl");
@@ -832,8 +960,12 @@ function cmdSplitCheck(opts = {}) {
     if (edgeReachable && haveCACert && haveCurl) {
       const tempListen = "127.0.0.1:18448";
       const tempAddr = parseListenAddr(tempListen);
-      // Spawn a temporary local proxy as a subprocess (avoids event-loop blocking)
-      const tempProc = spawn(process.execPath, [SCRIPT_PATH, "split", "local", "--edge", edgeAddr, "--listen", tempListen], {
+      // Temporarily save config with test listen addr, then spawn local daemon
+      const savedLocalListen = cfg.split?.local_listen;
+      cfg.split = cfg.split || {};
+      cfg.split.local_listen = tempListen;
+      saveConfig(cfg);
+      const tempProc = spawn(process.execPath, [SCRIPT_PATH, "--_split-local-daemon"], {
         stdio: "ignore",
         detached: true,
       });
@@ -857,6 +989,10 @@ function cmdSplitCheck(opts = {}) {
         check("split proxy chain", false, `failed after ${latency}ms: ${cause} → ${testUrl}`);
       }
       try { process.kill(tempProc.pid, "SIGTERM"); } catch {}
+      // Restore original config
+      if (savedLocalListen !== undefined) cfg.split.local_listen = savedLocalListen;
+      else delete cfg.split.local_listen;
+      saveConfig(cfg);
     }
   } else {
     check("edge proxy", false, "curl not available");
@@ -1124,11 +1260,11 @@ function printHelp() {
     ${NAME} proxy show                               - show current config
     ${NAME} proxy unset                              - clear proxy config
     ${NAME} proxy check [--url URL] [--timeout S]     - full diagnostic & connectivity
-    ${NAME} split start [--edge] [--ssh user@host]   - start split daemon
-    ${NAME} split stop                               - stop all split daemons
-    ${NAME} split status                             - show daemon status
+    ${NAME} split start [user@host]                  - start split daemon
+    ${NAME} split stop                               - stop local + remote daemons
+    ${NAME} split status                             - show daemon + tunnel status
     ${NAME} split logs                               - show daemon logs
-    ${NAME} split check [--edge 127.0.0.1:19090] [--url URL]  - diagnose split proxy chain
+    ${NAME} split check [--url URL] [--timeout S]    - diagnose split proxy chain
     ${NAME} install [--force]                        - install both codex-relay & codex CLI
     ${NAME} install --update                         - update codex CLI
     ${NAME} install --version X                      - install specific codex version
@@ -1149,18 +1285,9 @@ function parseArgs(argv) {
   const opts = { _: [] };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--url" || argv[i] === "--timeout" || argv[i] === "--version" ||
-        argv[i] === "--listen" || argv[i] === "--ssh" || argv[i] === "--ssh-key" ||
-        argv[i] === "--host" || argv[i] === "--user" || argv[i] === "--key") {
+        argv[i] === "--listen" || argv[i] === "--ssh-key") {
       opts[argv[i].replace(/^--/, "")] = argv[i + 1];
       i++;
-    } else if (argv[i] === "--edge") {
-      // --edge can be a flag (split start) or take a value (split check)
-      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
-        opts.edge = argv[i + 1];
-        i++;
-      } else {
-        opts.edge = true;
-      }
     } else if (argv[i] === "--update") {
       opts.update = true;
     } else if (argv[i] === "--force") {

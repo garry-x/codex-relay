@@ -62,11 +62,11 @@ codex → 本地 TLS 代理 → [SSH 隧道] → VPS Edge 代理 → OpenAI
 - 将解密后的 HTTP 通过 SSH 隧道转发给 edge 代理
 - 首次运行自动生成 CA 证书（ECDSA P-256，10 年有效）
 
-**Edge 代理** (`split start --edge`)：
-- 启动命令：`split start --edge`，在 VPS 上运行
+**Edge 代理** (`split start`)：
+- 在 VPS 上运行，自动检测 edge 模式（无 SSH 配置 → edge）
 - 监听 `127.0.0.1:19090`（仅 SSH 隧道可访问）
 - 解析 `X-Target: host:port` 元数据头
-- 建立到目标服务器的 TLS 连接（同区域，低延迟）
+- 若配置了 `proxy set`，通过静态代理连接目标；否则直连 TLS（同区域，低延迟）
 
 **SSH 隧道**：
 - `split start --ssh user@vps` 自动建立，PID 追踪，拆分时自动清理
