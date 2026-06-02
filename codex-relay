@@ -972,6 +972,31 @@ function _splitDaemonStatus(kind) {
   console.log(`  heartbeat:   ${hbAge}`);
 }
 
+function _ensureSshTunnel(host, edgePort, opts) {
+  const user = opts.user || "root";
+  const keyArg = opts.key ? ["-i", opts.key] : [];
+  const sshArgs = [
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "ServerAliveInterval=60",
+    "-o", "ExitOnForwardFailure=yes",
+    "-N", "-f",
+    "-L", `${edgePort}:127.0.0.1:${edgePort}`,
+    ...keyArg,
+    `${user}@${host}`,
+  ];
+  info(`auto SSH tunnel: localhost:${edgePort} → ${host}:${edgePort}`);
+  try {
+    execSync(`ssh ${sshArgs.map((a) => `'${a}'`).join(" ")} 2>&1`, { encoding: "utf8", timeout: 15000, stdio: "pipe" });
+  } catch (e) {
+    const msg = (e.stderr || e.stdout || e.message || "").toString();
+    // Already bound = tunnel likely already exists from a previous process
+    if (msg.includes("ddress already in use") || msg.includes("bind")) return;
+    die(`ssh tunnel failed: ${msg.trim()}`);
+  }
+  // Give ssh -f a moment to background
+  execSync("sleep 0.5", { stdio: "ignore" });
+}
+
 function cmdSplit(args) {
   const role = args[0];
   const action = args[1];
@@ -1003,9 +1028,17 @@ function cmdSplit(args) {
     if (!action || action === "start") {
       const edge = opts.edge;
       if (!edge) die("--edge <host:port> is required");
+      // Auto-establish SSH tunnel if --host is specified AND edge is not localhost
+      const edgeAddr = parseListenAddr(edge);
+      if (opts.host && (edgeAddr.host === "127.0.0.1" || edgeAddr.host === "localhost")) {
+        _ensureSshTunnel(opts.host, edgeAddr.port, opts);
+      }
       const cfg = loadConfig();
       cfg.split = cfg.split || {};
       cfg.split.local = { edge, listen: opts.listen || cfg.split?.local?.listen || "127.0.0.1:8443" };
+      if (opts.host) cfg.split.local.host = opts.host;
+      if (opts.user) cfg.split.local.user = opts.user;
+      if (opts.key) cfg.split.local.key = opts.key;
       saveConfig(cfg);
       _splitDaemonStart("local", [SCRIPT_PATH, "--_split-local-daemon"]);
       return;
@@ -1017,6 +1050,9 @@ function cmdSplit(args) {
     const edge = opts.edge;
     if (!edge) die("--edge <host:port> is required");
     const edgeAddr = parseListenAddr(edge);
+    if (opts.host && (edgeAddr.host === "127.0.0.1" || edgeAddr.host === "localhost")) {
+      _ensureSshTunnel(opts.host, edgeAddr.port, opts);
+    }
     const listen = parseListenAddr(opts.listen || "127.0.0.1:8443");
     startSplitLocal({ listen: `${listen.host}:${listen.port}`, edgeHost: edgeAddr.host, edgePort: edgeAddr.port });
     setInterval(() => {}, 60000);
@@ -1025,34 +1061,12 @@ function cmdSplit(args) {
 
   // ── top-level subcommands ──
   switch (role) {
-    case "tunnel": {
-      const host = opts.host;
-      if (!host) die("--host <ssh-server> is required");
-      const user = opts.user || "root";
-      const lport = opts["local-port"] || "9090";
-      const rport = opts["remote-port"] || "9090";
-      const keyArg = opts.key ? ["-i", opts.key] : [];
-      const args = [
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "ServerAliveInterval=60",
-        "-o", "ExitOnForwardFailure=yes",
-        "-N", "-f",
-        "-L", `${lport}:127.0.0.1:${rport}`,
-        ...keyArg,
-        `${user}@${host}`,
-      ];
-      info(`ssh tunnel: localhost:${lport} → ${host}:${rport}`);
-      const proc = spawn("ssh", args, { stdio: "inherit" });
-      proc.on("close", (code) => process.exit(code || 0));
-      proc.on("error", () => process.exit(1));
-      break;
-    }
     case "check": {
       cmdSplitCheck(opts);
       break;
     }
     default:
-      die(`usage: ${NAME} split {edge|local} {start|stop|restart|status|run}  |  split {tunnel|check}`);
+      die(`usage: ${NAME} split {edge|local} {start|stop|restart|status|run}  |  split check`);
   }
 }
 
@@ -1467,9 +1481,8 @@ function printHelp() {
     ${NAME} chain token generate                     - generate and save relay token
     ${NAME} chain start|stop|status|logs             - manage chain relay daemon
     ${NAME} split edge start|stop|restart|status    - manage VPS edge daemon
-    ${NAME} split local start --edge 127.0.0.1:9090 - start local TLS daemon
+    ${NAME} split local start --edge 127.0.0.1:9090 [--host HOST]  - start local TLS daemon (auto SSH tunnel)
     ${NAME} split local stop|restart|status         - manage local proxy daemon
-    ${NAME} split tunnel --host 1.2.3.4             - establish SSH tunnel to VPS
     ${NAME} split check [--edge 127.0.0.1:9090] [--url URL]  - diagnose split proxy chain
     ${NAME} install [--force]                        - install both codex-relay & codex CLI
     ${NAME} install --update                         - update codex CLI
@@ -1493,8 +1506,7 @@ function parseArgs(argv) {
     if (argv[i] === "--url" || argv[i] === "--timeout" || argv[i] === "--version" ||
         argv[i] === "--listen" || argv[i] === "--upstream" || argv[i] === "--token" ||
         argv[i] === "--tls-cert" || argv[i] === "--tls-key" || argv[i] === "--edge" ||
-        argv[i] === "--host" || argv[i] === "--user" || argv[i] === "--local-port" ||
-        argv[i] === "--remote-port" || argv[i] === "--key") {
+        argv[i] === "--host" || argv[i] === "--user" || argv[i] === "--key") {
       opts[argv[i].replace(/^--/, "")] = argv[i + 1];
       i++;
     } else if (argv[i] === "--update") {
