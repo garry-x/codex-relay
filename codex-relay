@@ -491,9 +491,9 @@ function cmdVpsSetup(target) {
 
   // Start forwarder
   try {
-    const out = _vpsExec("pkill -f codex-relay-forward 2>/dev/null; sleep 0.3; nohup codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1 & sleep 1; ss -tlnp | grep 8443");
+    const out = _vpsExec("pkill -f codex-relay-forward 2>/dev/null; sleep 0.5; nohup codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1 & for i in 1 2 3 4 5; do sleep 0.5; ss -tlnp | grep -q 8443 && break; done; ss -tlnp | grep 8443 || echo 'FAILED'");
     info(out.trim());
-  } catch (e) { info(`start failed — run manually on VPS: codex-relay-forward 0.0.0.0:8443`); }
+  } catch (e) { info(`start failed — run codex-relay vps start`); }
 
   info("VPS setup complete.");
 }
@@ -512,7 +512,7 @@ function cmdVpsProxy(action, url) {
 }
 
 function cmdVpsStart() {
-  const out = _vpsExec("nohup codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1 & sleep 1; ss -tlnp | grep 8443 || echo 'FAILED'");
+  const out = _vpsExec("pkill -f codex-relay-forward 2>/dev/null; sleep 0.5; nohup codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1 & for i in 1 2 3 4 5; do sleep 0.5; ss -tlnp | grep -q 8443 && break; done; ss -tlnp | grep 8443 || echo 'FAILED'");
   if (out.includes("FAILED")) die("VPS forwarder failed to start. Check: ssh vps \"cat /tmp/codex-relay-forward.log\"");
   info(`VPS forwarder started:\n${out.trim()}`);
 }
