@@ -157,22 +157,25 @@ codex-relay split edge start
 
 Edge 代理维护到目标（如 api.openai.com）的 HTTPS 连接，所有 TLS 握手在同区域内完成。
 
-#### 第二步：在本机建立 SSH 隧道并启动本地代理
+#### 第二步：在本机启动本地代理（自动建立 SSH 隧道）
 
 ```bash
-# 1. 建立 SSH 隧道（或使用 split tunnel 命令）
-codex-relay split tunnel --host your-vps
-
-# 等价于:
-# ssh -N -f -L 9090:127.0.0.1:9090 root@your-vps
-
-# 2. 启动本地 TLS 终止代理（后台守护进程）
-codex-relay split local start --edge 127.0.0.1:9090
+# 一条命令：自动建立 SSH 隧道 + 启动本地 TLS 代理
+codex-relay split local start --edge 127.0.0.1:9090 --host your-vps
 
 # 首次运行自动生成本地 CA 证书，后续复用
+# --host 触发自动 SSH 隧道，隧道 PID 记录到 ~/.codex-relay/split-tunnel.pid
+# 重新启动时会检测已存在的隧道并复用
 ```
 
 本地代理接收 codex 的 CONNECT 请求，在本地完成 TLS 握手（localhost，接近 0ms），将解密后的 HTTP 请求通过 SSH 隧道转发给 VPS edge。
+
+**手动 SSH 隧道**（可选，不使用 `--host` 时）：
+
+```bash
+ssh -N -f -L 9090:127.0.0.1:9090 root@your-vps
+codex-relay split local start --edge 127.0.0.1:9090
+```
 
 #### 第三步：配置并使用
 
@@ -207,10 +210,16 @@ codex-relay run chat
 |---|---|
 | `split edge start [--listen <host:port>]` | 后台启动 VPS edge 守护进程 |
 | `split edge stop / restart / status` | 管理 edge 守护进程 |
-| `split local start --edge <host:port> [--listen <host:port>]` | 后台启动本地 TLS 终止守护进程 |
-| `split local stop / restart / status` | 管理本地守护进程 |
-| `split tunnel --host <vps> [--user root] [--local-port 9090] [--remote-port 9090]` | 一键建立 SSH 隧道到 VPS |
+| `split local start --edge <host:port> --host <vps>` | 后台启动本地 TLS 代理（自动 SSH 隧道，`--host` 可选） |
+| `split local stop / restart / status` | 管理本地守护进程，stop 时自动清理 SSH 隧道 |
 | `split check [--edge <host:port>] [--url URL] [--timeout S]` | 端到端诊断：CA 证书、edge 可达性、TLS 终止、完整链路 |
+
+### 生命周期
+
+- `split local start --host <vps>` 自动建立 SSH 隧道并记录 PID
+- 重新启动时检测隧道 PID 是否存活，存活则复用
+- 若端口被占用但 PID 已死，自动释放端口并重建隧道
+- `split local stop` 或 Ctrl+C 时优雅退出：关闭本地代理 → 终止 SSH 隧道 → 清理 PID 文件
 
 ### 架构安全
 
@@ -239,8 +248,7 @@ codex-relay
 
   Split 代理:
     split edge start|stop|restart|status  管理 VPS edge 守护进程
-    split local start|stop|restart|status 管理本地 TLS 守护进程
-    split tunnel --host <vps>             建立 SSH 隧道
+    split local start|stop|restart|status 管理本地 TLS 代理 (--host 自动隧道)
     split check [--edge <host:port>]      端到端诊断
 
   通用:
@@ -279,6 +287,9 @@ codex-relay chat                        # 直接透传（效果相同）
 ├── chain.pid            # 链式中转 PID
 ├── chain.log            # 链式中转请求日志
 ├── chain.heartbeat      # 链式中转心跳
+├── split-edge.pid       # Split edge 守护进程 PID
+├── split-local.pid      # Split local 守护进程 PID
+├── split-tunnel.pid     # SSH 隧道进程 PID
 └── certs/               # Split 代理 CA 证书 & 域名证书缓存
     ├── ca-key.pem
     ├── ca-cert.pem
