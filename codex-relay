@@ -626,6 +626,7 @@ function runSplitLocalDaemon() {
     try { server.close(); } catch {}
     try { fs.unlinkSync(SPLIT_LOCAL_PID_FILE); } catch {}
     try { fs.unlinkSync(SPLIT_LOCAL_HB_FILE); } catch {}
+    _cleanupSplitTunnel();
     process.exit(0);
   };
   process.on("SIGTERM", cleanup);
@@ -947,6 +948,14 @@ function _splitDaemonStart(kind, spawnArgs) {
   info(`split ${kind} started (pid ${fs.readFileSync(pidFile, "utf8").trim()})`);
 }
 
+function _cleanupSplitTunnel() {
+  try {
+    const pid = parseInt(fs.readFileSync(SPLIT_TUNNEL_PID_FILE, "utf8").trim(), 10);
+    if (pid) { process.kill(pid, "SIGTERM"); }
+  } catch {}
+  try { fs.unlinkSync(SPLIT_TUNNEL_PID_FILE); } catch {}
+}
+
 function _splitDaemonStop(kind) {
   const pidFile = kind === "edge" ? SPLIT_EDGE_PID_FILE : SPLIT_LOCAL_PID_FILE;
   const hbFile = kind === "edge" ? SPLIT_EDGE_HB_FILE : SPLIT_LOCAL_HB_FILE;
@@ -956,6 +965,7 @@ function _splitDaemonStop(kind) {
   try { process.kill(pid, "SIGTERM"); } catch {}
   try { fs.unlinkSync(pidFile); } catch {}
   try { fs.unlinkSync(hbFile); } catch {}
+  if (kind === "local") _cleanupSplitTunnel();
   info(`split ${kind} stopped.`);
 }
 
@@ -1051,7 +1061,10 @@ function cmdSplit(args) {
     if (action === "restart") { _splitDaemonStop("edge"); _splitDaemonStart("edge", [SCRIPT_PATH, "--_split-edge-daemon"]); return; }
     // "run" or anything else = foreground
     const listen = parseListenAddr(opts.listen || "127.0.0.1:9090");
-    startSplitEdge({ listen: `${listen.host}:${listen.port}` });
+    const edgeServer = startSplitEdge({ listen: `${listen.host}:${listen.port}` });
+    const edgeCleanup = () => { try { edgeServer.close(); } catch {} process.exit(0); };
+    process.on("SIGINT", edgeCleanup);
+    process.on("SIGTERM", edgeCleanup);
     setInterval(() => {}, 60000);
     return;
   }
@@ -1087,7 +1100,10 @@ function cmdSplit(args) {
       _ensureSshTunnel(opts.host, edgeAddr.port, opts);
     }
     const listen = parseListenAddr(opts.listen || "127.0.0.1:8443");
-    startSplitLocal({ listen: `${listen.host}:${listen.port}`, edgeHost: edgeAddr.host, edgePort: edgeAddr.port });
+    const localServer = startSplitLocal({ listen: `${listen.host}:${listen.port}`, edgeHost: edgeAddr.host, edgePort: edgeAddr.port });
+    const localCleanup = () => { try { localServer.close(); } catch {} _cleanupSplitTunnel(); process.exit(0); };
+    process.on("SIGINT", localCleanup);
+    process.on("SIGTERM", localCleanup);
     setInterval(() => {}, 60000);
     return;
   }
