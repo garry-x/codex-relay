@@ -497,7 +497,7 @@ function cmdVpsSetup(target) {
 
   // Start forwarder via ssh -f (fully detached)
   try {
-    execSync(`ssh -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${target}' "pkill -f codex-relay-forward 2>/dev/null; sleep 0.5"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" });
+    execSync(`ssh -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${target}' "pkill -f codex-relay-forward 2>/dev/null; fuser -k 8443/tcp 2>/dev/null; sleep 0.5; true"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" });
     execSync(`ssh -f -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${target}' "codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" });
   } catch (e) { info(`start via ssh failed — run codex-relay vps start`); }
 
@@ -524,8 +524,8 @@ function cmdVpsStart() {
   const keyArg = cfg.vps?.key ? ["-i", cfg.vps.key] : [];
   const sshArgs = `-o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")}`.trim();
 
-  // Kill old, start new via ssh -f (fully detached)
-  try { execSync(`ssh ${sshArgs} '${dest}' "pkill -f codex-relay-forward 2>/dev/null; sleep 0.5"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" }); } catch {}
+  // Kill old, free port, start new via ssh -f (fully detached)
+  try { execSync(`ssh ${sshArgs} '${dest}' "pkill -f codex-relay-forward 2>/dev/null; fuser -k 8443/tcp 2>/dev/null; sleep 0.5; true"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" }); } catch {}
   try { execSync(`ssh -f ${sshArgs} '${dest}' "codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" }); } catch {}
 
   // Wait and check

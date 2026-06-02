@@ -105,6 +105,16 @@ const server = net.createServer((client) => {
   client.on("error", () => {});
 });
 
+server.on("error", (e) => {
+  if (e.code === "EADDRINUSE") {
+    console.error(`port ${addr.port} in use, retrying in 1s...`);
+    setTimeout(() => { server.close(); server.listen(addr.port, addr.host, () => { console.error(`[codex-relay-forward] ${addr.host}:${addr.port} → ${REDACTED}`); }); }, 1000);
+    return;
+  }
+  console.error("server error:", e.message);
+  process.exit(1);
+});
+
 server.listen(addr.port, addr.host, () => {
   console.error(`[codex-relay-forward] ${addr.host}:${addr.port} → ${REDACTED}`);
 });
