@@ -1078,7 +1078,15 @@ function cmdSplit(args) {
     }
     if (action === "stop") { _splitDaemonStop("edge"); return; }
     if (action === "status") { _splitDaemonStatus("edge"); return; }
-    if (action === "restart") { _splitDaemonStop("edge"); _splitDaemonStart("edge", [SCRIPT_PATH, "--_split-edge-daemon"]); return; }
+    if (action === "restart") {
+      _splitDaemonStop("edge");
+      const cfg = loadConfig();
+      cfg.split = cfg.split || {};
+      cfg.split.edge = { listen: opts.listen || cfg.split?.edge?.listen || "127.0.0.1:19090" };
+      saveConfig(cfg);
+      _splitDaemonStart("edge", [SCRIPT_PATH, "--_split-edge-daemon"]);
+      return;
+    }
     // "run" or anything else = foreground
     const listen = parseListenAddr(opts.listen || "127.0.0.1:19090");
     const edgeServer = startSplitEdge({ listen: `${listen.host}:${listen.port}` });
@@ -1111,7 +1119,24 @@ function cmdSplit(args) {
     }
     if (action === "stop") { _splitDaemonStop("local"); return; }
     if (action === "status") { _splitDaemonStatus("local"); return; }
-    if (action === "restart") { _splitDaemonStop("local"); _splitDaemonStart("local", [SCRIPT_PATH, "--_split-local-daemon"]); return; }
+    if (action === "restart") {
+      _splitDaemonStop("local");
+      const cfg = loadConfig();
+      // Re-establish tunnel and save config (same as start)
+      const edge2 = opts.edge || cfg.split?.local?.edge || "127.0.0.1:19090";
+      const edgeAddr2 = parseListenAddr(edge2);
+      if (opts.host && (edgeAddr2.host === "127.0.0.1" || edgeAddr2.host === "localhost")) {
+        _ensureSshTunnel(opts.host, edgeAddr2.port, opts);
+      }
+      cfg.split = cfg.split || {};
+      cfg.split.local = { edge: edge2, listen: opts.listen || cfg.split?.local?.listen || "127.0.0.1:18443" };
+      if (opts.host) cfg.split.local.host = opts.host;
+      if (opts.user) cfg.split.local.user = opts.user;
+      if (opts.key) cfg.split.local.key = opts.key;
+      saveConfig(cfg);
+      _splitDaemonStart("local", [SCRIPT_PATH, "--_split-local-daemon"]);
+      return;
+    }
     // "run" or anything else = foreground
     const edge = opts.edge;
     if (!edge) die("--edge <host:port> is required");
