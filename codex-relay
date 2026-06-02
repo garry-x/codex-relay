@@ -495,10 +495,10 @@ function cmdVpsSetup(target) {
   try { execSync(deployCmd, { encoding: "utf8", timeout: 15000, stdio: "pipe" }); }
   catch (e) { die(`deploy failed: ${e.message}`); }
 
-  // Start forwarder via ssh -f (fully detached)
+  // Start forwarder via ssh -f (fully detached, handles EADDRINUSE internally)
   try {
-    execSync(`ssh -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${target}' "pkill -f codex-relay-forward 2>/dev/null; fuser -k 8443/tcp 2>/dev/null; sleep 0.5; true"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" });
     execSync(`ssh -f -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${target}' "codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" });
+    info("forwarder start triggered — check with: codex-relay vps status");
   } catch (e) { info(`start via ssh failed — run codex-relay vps start`); }
 
   info("VPS setup complete.");
@@ -524,12 +524,12 @@ function cmdVpsStart() {
   const keyArg = cfg.vps?.key ? ["-i", cfg.vps.key] : [];
   const sshArgs = `-o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")}`.trim();
 
-  // Kill old, free port, start new via ssh -f (fully detached)
-  try { execSync(`ssh ${sshArgs} '${dest}' "pkill -f codex-relay-forward 2>/dev/null; fuser -k 8443/tcp 2>/dev/null; sleep 0.5; true"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" }); } catch {}
-  try { execSync(`ssh -f ${sshArgs} '${dest}' "codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" }); } catch {}
+  // Start via ssh -f (fully detached, forwarder handles EADDRINUSE)
+  try { execSync(`ssh -f ${sshArgs} '${dest}' "codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" }); }
+  catch (e) { die(`VPS start failed: ${e.message}`); }
 
   // Wait and check
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 6; i++) {
     execSync("sleep 0.5", { stdio: "ignore" });
     const status = _vpsExecNoFail("ss -tlnp | grep 8443");
     if (status.trim()) {
