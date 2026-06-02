@@ -322,10 +322,20 @@ function handleSplitEdgeConnection(socket, proxyUrl) {
   socket.setKeepAlive(true, 30000);
   let buf = Buffer.alloc(0);
   let targetSocket = null;
+  let connecting = false;  // true while TLS/proxy connection is being established
+
+  function flushRemaining(data) {
+    if (targetSocket && data.length > 0) targetSocket.write(data);
+  }
 
   socket.on("data", (chunk) => {
     if (targetSocket) {
       targetSocket.write(chunk);
+      return;
+    }
+    if (connecting) {
+      // Buffer data arriving while TLS / proxy connection is being set up
+      buf = Buffer.concat([buf, chunk]);
       return;
     }
     buf = Buffer.concat([buf, chunk]);
@@ -340,17 +350,19 @@ function handleSplitEdgeConnection(socket, proxyUrl) {
     const host = m[1].trim();
     const port = parseInt(m[2], 10);
     const remaining = buf.slice(metaEnd + 4);
-    buf = null;
+    buf = Buffer.alloc(0);  // reset for buffering data during connect
+    connecting = true;
 
     const proxy = _parseEdgeProxy(proxyUrl);
     if (proxy) {
-      // Connect through upstream static proxy
       _splitLog("edge", `proxy connect to ${host}:${port} via ${proxyUrl}`);
       const proxySock = _edgeConnectViaProxy(host, port, proxy, (tlsSock) => {
         tlsSock.setNoDelay(true);
         tlsSock.setKeepAlive(true, 30000);
         targetSocket = tlsSock;
+        connecting = false;
         if (remaining.length > 0) tlsSock.write(remaining);
+        if (buf.length > 0) { tlsSock.write(buf); buf = Buffer.alloc(0); }
         socket.pipe(tlsSock);
         tlsSock.pipe(socket);
         tlsSock.on("end", () => { try { socket.end(); } catch {} });
@@ -366,7 +378,9 @@ function handleSplitEdgeConnection(socket, proxyUrl) {
       tlsSock.setNoDelay(true);
       tlsSock.setKeepAlive(true, 30000);
       targetSocket = tlsSock;
+      connecting = false;
       if (remaining.length > 0) tlsSock.write(remaining);
+      if (buf.length > 0) { tlsSock.write(buf); buf = Buffer.alloc(0); }
       socket.pipe(tlsSock);
       tlsSock.pipe(socket);
       tlsSock.on("end", () => { try { socket.end(); } catch {} });
@@ -1008,34 +1022,45 @@ function cmdSplitCheck(opts = {}) {
   const haveCurl = !!shutil("curl");
   check("curl", haveCurl, haveCurl ? "available" : "not found — required for connectivity test");
 
+  function canConnect(host, port, timeoutMs = 2000) {
+    return new Promise((resolve) => {
+      const s = net.connect(port, host);
+      const done = (ok) => {
+        try { s.destroy(); } catch {}
+        resolve(ok);
+      };
+      s.setTimeout(timeoutMs);
+      s.once("connect", () => done(true));
+      s.once("timeout", () => done(false));
+      s.once("error", () => done(false));
+    });
+  }
+
   // 4. Edge proxy reachable
   if (haveCurl) {
     const { host: edgeHost, port: edgePort } = parseListenAddr(edgeAddr);
-    const edgeReachable = (() => {
-      try {
-        execSync(`timeout 2 bash -c 'echo >/dev/tcp/${edgeHost}/${edgePort}' 2>/dev/null`, { timeout: 3000 });
-        return true;
-      } catch { return false; }
-    })();
+    const connectHost = edgeHost === "0.0.0.0" ? "127.0.0.1" : edgeHost;
+    const edgeReachable = execSync(
+      `${process.execPath} -e "const net=require('net');const s=net.connect(${edgePort}, '${connectHost.replace(/'/g, "\\'")}');s.setTimeout(2000);s.once('connect',()=>{s.destroy();process.exit(0)});s.once('timeout',()=>process.exit(1));s.once('error',()=>process.exit(1));"`,
+      { stdio: "ignore", timeout: 3000 }
+    ) === undefined;
     check("edge proxy", edgeReachable, `TCP ${edgeAddr}` + (edgeReachable ? " open" : " unreachable — check SSH tunnel or edge server"));
 
     // 5. Full split proxy chain
     if (edgeReachable && haveCACert && haveCurl) {
       const tempListen = "127.0.0.1:18448";
       const tempAddr = parseListenAddr(tempListen);
-      // Temporarily save config with test listen addr, then spawn local daemon
-      const savedLocalListen = cfg.split?.local_listen;
-      cfg.split = cfg.split || {};
-      cfg.split.local_listen = tempListen;
-      saveConfig(cfg);
-      const tempProc = spawn(process.execPath, [SCRIPT_PATH, "--_split-local-daemon"], {
-        stdio: "ignore",
-        detached: true,
-      });
+      const tempServer = startSplitLocal({ listen: tempListen, edgeHost: connectHost, edgePort });
       // Wait for it to start listening
       for (let i = 0; i < 20; i++) {
         execSync("sleep 0.1", { stdio: "ignore" });
-        try { const s = net.connect(tempAddr.port, tempAddr.host); s.destroy(); break; } catch {}
+        try {
+          execSync(
+            `${process.execPath} -e "const net=require('net');const s=net.connect(${tempAddr.port}, '${tempAddr.host}');s.setTimeout(500);s.once('connect',()=>{s.destroy();process.exit(0)});s.once('timeout',()=>process.exit(1));s.once('error',()=>process.exit(1));"`,
+            { stdio: "ignore", timeout: 1000 }
+          );
+          break;
+        } catch {}
       }
       const start = Date.now();
       try {
@@ -1051,11 +1076,7 @@ function cmdSplitCheck(opts = {}) {
         const cause = e.stderr ? e.stderr.toString().trim().slice(0, 80) : (e.message || "").slice(0, 80);
         check("split proxy chain", false, `failed after ${latency}ms: ${cause} → ${testUrl}`);
       }
-      try { process.kill(tempProc.pid, "SIGTERM"); } catch {}
-      // Restore original config
-      if (savedLocalListen !== undefined) cfg.split.local_listen = savedLocalListen;
-      else delete cfg.split.local_listen;
-      saveConfig(cfg);
+      try { tempServer.close(); } catch {}
     }
   } else {
     check("edge proxy", false, "curl not available");
