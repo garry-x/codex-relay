@@ -551,8 +551,12 @@ function runSplitEdgeDaemon() {
       _splitLog("edge", `pipe broken`);
       return;
     }
-    _splitLog("edge", `CRASH: ${e.message}`);
+    _splitLog("edge", `CRASH: ${e.message} — restarting...`);
     try { fs.unlinkSync(SPLIT_EDGE_PID_FILE); } catch {}
+    try { server.close(); } catch {}
+    // Respawn edge daemon after crash
+    const child = spawn(process.execPath, [SCRIPT_PATH, "--_split-edge-daemon"], { detached: true, stdio: "ignore" });
+    child.unref();
     process.exit(1);
   });
   const hbInterval = setInterval(() => { try { fs.writeFileSync(SPLIT_EDGE_HB_FILE, String(Date.now())); } catch {} }, 60000);
