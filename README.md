@@ -164,12 +164,39 @@ ssh root@vps "ss -tlnp | grep 8443"
 codex-relay run doctor
 ```
 
-## 依赖
+## 环境依赖
 
-| 组件 | 用途 |
-|---|---|
-| Node.js >= 18 | 运行 codex-relay 和 forwarder（零 npm 依赖） |
-| curl | `proxy check` 连通性测试 |
-| npm | 安装 Codex CLI |
-| Tailscale | 本机 ↔ VPS 加密隧道 |
-| macOS / Linux | 操作系统 |
+### 本机（客户端）
+
+| 依赖 | 版本要求 | 用途 |
+|---|---|---|
+| Node.js | >= 18 | 运行 codex-relay（`net`, `fs`, `path`, `os`, `child_process`, `crypto` 均为内置模块，零 npm 依赖） |
+| npm | 任意 | 安装 Codex CLI（`npm install -g @openai/codex`） |
+| curl | 任意 | `proxy check` 连通性诊断 |
+| Tailscale | 任意 | 与 VPS 建立 WireGuard 加密隧道 |
+| 操作系统 | macOS / Linux | Windows 未测试 |
+
+### VPS（转发服务器）
+
+| 依赖 | 版本要求 | 用途 |
+|---|---|---|
+| Node.js | >= 18 | 运行 codex-relay-forward（仅 `net`, `fs`, `path`, `os` 内置模块） |
+| Tailscale | 任意 | 与本机建立 WireGuard 加密隧道 |
+| 操作系统 | Linux | 推荐 Ubuntu 20.04+ / Debian 11+ |
+
+### 网络要求
+
+| 链路 | 协议 | 说明 |
+|---|---|---|
+| 本机 → VPS | Tailscale (WireGuard) | UDP，需要 Tailscale 组网 |
+| VPS → 上游代理 | TCP | HTTP CONNECT 隧道 |
+| 上游代理 → OpenAI | TCP + TLS | 代理转发 |
+
+### 环境变量
+
+| 变量 | 作用域 | 说明 |
+|---|---|---|
+| `HTTP_PROXY` / `HTTPS_PROXY` | 本机 | 优先于 config.json，指向 VPS Tailscale IP |
+| `FORWARD_PROXY` | VPS | forwarder 使用的上游代理，优先于 config.json |
+| `FORWARD_LISTEN` | VPS | forwarder 监听地址，默认 `0.0.0.0:8443` |
+| `NODE_EXTRA_CA_CERTS` | — | 不再需要（不进行 TLS 终止） |
