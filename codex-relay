@@ -486,30 +486,36 @@ async function _checkUpdate(scriptPath, restart = false) {
   } catch {}
   try { fs.writeFileSync(lastCheckFile, String(Date.now())); } catch {}
 
+  // Fetch remote script
+  let remoteScript = "";
   let remoteVersion = "";
   try {
-    const resp = await fetch(UPDATE_URL, { signal: AbortSignal.timeout(10000) });
+    const resp = await fetch(UPDATE_URL, { signal: AbortSignal.timeout(15000) });
     if (!resp.ok) return;
-    const text = await resp.text();
-    const m = text.match(/const VERSION\s*=\s*"([^"]+)"/);
+    remoteScript = await resp.text();
+    const m = remoteScript.match(/const VERSION\s*=\s*"([^"]+)"/);
     if (!m) return;
     remoteVersion = m[1];
   } catch {
     return;
   }
 
-  if (remoteVersion === VERSION) return;
+  // Compute hashes
+  const localHash = crypto.createHash("sha256").update(fs.readFileSync(scriptPath, "utf8")).digest("hex");
+  const remoteHash = crypto.createHash("sha256").update(remoteScript).digest("hex");
 
-  info(`new version ${remoteVersion} available (current: ${VERSION}) — updating...`);
-  _splitLog("edge", `new version ${remoteVersion} available (current: ${VERSION}) — updating...`);
+  if (remoteVersion === VERSION && localHash === remoteHash) return;
+
+  const reason = remoteVersion !== VERSION
+    ? `version ${VERSION} → ${remoteVersion}`
+    : `same version ${VERSION} but code changed (${localHash.slice(0,8)} → ${remoteHash.slice(0,8)})`;
+
+  info(`update available (${reason}) — updating...`);
+  _splitLog("edge", `update available (${reason}) — updating...`);
   try {
-    const resp = await fetch(UPDATE_URL, { signal: AbortSignal.timeout(30000) });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const newScript = await resp.text();
-    if (!newScript.includes(`"${remoteVersion}"`)) throw new Error("version mismatch");
-    fs.writeFileSync(scriptPath, newScript, { mode: 0o755 });
-    _splitLog("edge", `updated to ${remoteVersion}`);
-    info(`updated to ${remoteVersion}`);
+    fs.writeFileSync(scriptPath, remoteScript, { mode: 0o755 });
+    _splitLog("edge", `updated (${remoteHash.slice(0, 8)})`);
+    info(`updated to ${remoteVersion} (${remoteHash.slice(0, 8)})`);
     if (restart) {
       _splitLog("edge", "restarting...");
       const child = spawn(process.execPath, [scriptPath, "--_split-edge-daemon"], { detached: true, stdio: "ignore" });
