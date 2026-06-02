@@ -485,6 +485,11 @@ function runSplitEdgeDaemon() {
     process.exit(1);
   });
   const hbInterval = setInterval(() => { try { fs.writeFileSync(SPLIT_EDGE_HB_FILE, String(Date.now())); } catch {} }, 60000);
+  // Kill any zombie edge daemon holding our port
+  try {
+    const { port } = parseListenAddr(listen);
+    execSync(`fuser -k ${port}/tcp 2>/dev/null || true`, { encoding: "utf8", timeout: 3000 });
+  } catch {}
   const server = startSplitEdge({ listen, proxyUrl });
   fs.writeFileSync(SPLIT_EDGE_PID_FILE, String(process.pid));
   try { process.stdin.destroy(); } catch {}
@@ -522,6 +527,11 @@ function runSplitLocalDaemon() {
     process.exit(1);
   });
   const hbInterval = setInterval(() => { try { fs.writeFileSync(SPLIT_LOCAL_HB_FILE, String(Date.now())); } catch {} }, 60000);
+  // Kill any zombie local daemon holding our port
+  try {
+    const { port: lp } = parseListenAddr(listen);
+    execSync(`fuser -k ${lp}/tcp 2>/dev/null || true`, { encoding: "utf8", timeout: 3000 });
+  } catch {}
   const server = startSplitLocal({ listen, edgeHost: "127.0.0.1", edgePort });
 
   // Tunnel watchdog: check every 30s, re-establish if died
