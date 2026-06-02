@@ -495,10 +495,10 @@ function cmdVpsSetup(target) {
   try { execSync(deployCmd, { encoding: "utf8", timeout: 15000, stdio: "pipe" }); }
   catch (e) { die(`deploy failed: ${e.message}`); }
 
-  // Start forwarder via ssh -f (fully detached, handles EADDRINUSE internally)
+  // Start forwarder via ssh (detached: nohup + </dev/null to avoid pipe fd leak)
   try {
-    execSync(`ssh -f -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${target}' "codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" });
-    info("forwarder start triggered — check with: codex-relay vps status");
+    execSync(`ssh -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${target}' "nohup codex-relay-forward 0.0.0.0:8443 </dev/null >/tmp/codex-relay-forward.log 2>&1 &"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" });
+    info("forwarder started");
   } catch (e) { info(`start via ssh failed — run codex-relay vps start`); }
 
   info("VPS setup complete.");
@@ -524,8 +524,8 @@ function cmdVpsStart() {
   const keyArg = cfg.vps?.key ? ["-i", cfg.vps.key] : [];
   const sshArgs = `-o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")}`.trim();
 
-  // Start via ssh -f (fully detached, forwarder handles EADDRINUSE)
-  try { execSync(`ssh -f ${sshArgs} '${dest}' "codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" }); }
+  // Start detached: nohup + </dev/null avoids pipe fd leak
+  try { execSync(`ssh ${sshArgs} '${dest}' "nohup codex-relay-forward 0.0.0.0:8443 </dev/null >/tmp/codex-relay-forward.log 2>&1 &"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" }); }
   catch (e) { die(`VPS start failed: ${e.message}`); }
 
   // Wait and check
