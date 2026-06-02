@@ -566,6 +566,11 @@ function runSplitEdgeDaemon() {
   const proxyUrl = cfg.split?.edge_proxy || "";
   _splitLog("edge", `daemon starting on ${listen}${proxyUrl ? `, upstream: ${proxyUrl}` : ""}`);
 
+  // Log exit reason for crash diagnosis
+  let _exitReason = "unknown";
+  process.on("exit", (code) => { _splitLog("edge", `exit code=${code} reason=${_exitReason}`); });
+  process.on("SIGHUP", () => { _exitReason = "SIGHUP"; process.exit(0); });
+
   // Check for updates in background (restarts daemon if updated)
   _checkUpdate(SCRIPT_PATH, true);
   process.on("uncaughtException", (e) => {
@@ -596,6 +601,7 @@ function runSplitEdgeDaemon() {
   try { fs.closeSync(1); } catch {}
   try { fs.closeSync(2); } catch {}
   const cleanup = () => {
+    _exitReason = "signal";
     _splitLog("edge", "daemon shutting down");
     clearInterval(hbInterval);
     try { server.close(); } catch {}
@@ -613,6 +619,12 @@ function runSplitLocalDaemon() {
   const edgePort = parseListenAddr(cfg.split?.edge_listen || "127.0.0.1:19090").port;
   const listen = cfg.split?.local_listen || "127.0.0.1:18443";
   _splitLog("local", `daemon starting on ${listen}, edge port ${edgePort}`);
+
+  // Log exit reason for crash diagnosis
+  let _exitReason = "unknown";
+  process.on("exit", (code) => { _splitLog("local", `exit code=${code} reason=${_exitReason}`); });
+  process.on("SIGHUP", () => { _exitReason = "SIGHUP"; process.exit(0); });
+
   process.on("uncaughtException", (e) => {
     // EPIPE is recoverable — tunnel died, watchdog will reconnect
     if (e.message?.includes("EPIPE")) {
@@ -647,19 +659,26 @@ function runSplitLocalDaemon() {
       }
     }
 
-    // Cache remote edge status for monitor
+    // Cache remote edge status + errors for monitor
     if (_tunnelPidAlive()) {
       try {
         const keyArg = cfg2.split.ssh_key ? ["-i", cfg2.split.ssh_key] : [];
-        const out = execSync(`ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${cfg2.split.ssh}' "codex-relay split status 2>&1 || true"`, { encoding: "utf8", timeout: 8000, stdio: "pipe" });
+        const out = execSync(`ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${cfg2.split.ssh}' "codex-relay-split status 2>&1 || true"`, { encoding: "utf8", timeout: 8000, stdio: "pipe" });
         const running = out.includes("split edge:  running");
         const pm = out.match(/pid (\d+)/);
         const hm = out.match(/heartbeat:\s+(\S+)/);
+        // Fetch recent edge errors
+        let errors = [];
+        try {
+          const errOut = execSync(`ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${cfg2.split.ssh}' "tail -30 ~/.codex-relay/logs/split-edge.log 2>/dev/null | grep -i -E \\"error|fail|crash|rejected|timed.out\\" | tail -5 || true"`, { encoding: "utf8", timeout: 5000, stdio: "pipe" });
+          errors = errOut.trim().split("\n").filter(Boolean).map(l => l.slice(0, 150));
+        } catch {}
         const status = {
           at: Date.now(),
           running,
           pid: pm ? pm[1] : "",
           hb: hm ? hm[1] : "N/A",
+          errors,
         };
         try { fs.mkdirSync(CONFIG_DIR, { recursive: true }); } catch {}
         fs.writeFileSync(EDGE_STATUS_FILE, JSON.stringify(status));
@@ -675,6 +694,7 @@ function runSplitLocalDaemon() {
   try { fs.closeSync(1); } catch {}
   try { fs.closeSync(2); } catch {}
   const cleanup = () => {
+    _exitReason = "signal";
     _splitLog("local", "daemon shutting down");
     clearInterval(tunnelWatchdog);
     clearInterval(hbInterval);
@@ -1134,27 +1154,43 @@ function cmdSplitMonitor() {
     }
     lines.push(_renderStatus("tunnel", tunnelAlive, tunnelDetail));
 
-    // Edge — use cached status to avoid SSH on every tick
+    // Edge — use cached status, fallback to direct SSH check
     edgeCache = _readCachedEdgeStatus();
     let edgeAlive = false, edgeDetail = "";
     if (edgeCache) {
       edgeAlive = edgeCache.running;
       edgeDetail = `pid ${edgeCache.pid}, hb ${edgeCache.hb}`;
+      if (edgeCache.errors && edgeCache.errors.length > 0) {
+        lines.push(_renderStatus("edge", edgeAlive, edgeDetail));
+        for (const e of edgeCache.errors) {
+          lines.push(`  \x1b[33m!\x1b[0m [edge] ${e}`);
+        }
+        edgeDetail = ""; // already rendered
+      }
     } else {
       const cfg = loadConfig();
       if (!cfg.split?.ssh) {
-        // This is the edge machine — check locally
         edgeAlive = isSplitEdgeRunning();
         if (edgeAlive) {
           try { edgeDetail = `pid ${fs.readFileSync(SPLIT_EDGE_PID_FILE, "utf8").trim()}`; } catch {}
-        } else {
-          edgeDetail = "stopped";
         }
+      } else if (tunnelAlive) {
+        // First tick: quick SSH check instead of showing "fetching..."
+        try {
+          const keyArg = cfg.split.ssh_key ? ["-i", cfg.split.ssh_key] : [];
+          const out = execSync(`ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${cfg.split.ssh}' "codex-relay-split status 2>&1 || true"`, { encoding: "utf8", timeout: 5000, stdio: "pipe" });
+          edgeAlive = out.includes("split edge:  running");
+          if (edgeAlive) {
+            const pm = out.match(/pid (\d+)/);
+            const hm = out.match(/heartbeat:\s+(\S+)/);
+            edgeDetail = `${pm ? "pid "+pm[1] : ""}${hm ? ", hb "+hm[1] : ""}`;
+          }
+        } catch { edgeDetail = "SSH unreachable"; }
       } else {
-        edgeDetail = "fetching...";
+        edgeDetail = "tunnel down";
       }
     }
-    lines.push(_renderStatus("edge", edgeAlive, edgeDetail));
+    if (edgeDetail) lines.push(_renderStatus("edge", edgeAlive, edgeDetail));
 
     lines.push("");
 
