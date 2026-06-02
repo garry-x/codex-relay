@@ -38,6 +38,30 @@ const SPLIT_EDGE_HB_FILE = path.join(CONFIG_DIR, "split-edge.heartbeat");
 const SPLIT_LOCAL_PID_FILE = path.join(CONFIG_DIR, "split-local.pid");
 const SPLIT_LOCAL_HB_FILE = path.join(CONFIG_DIR, "split-local.heartbeat");
 const SPLIT_TUNNEL_PID_FILE = path.join(CONFIG_DIR, "split-tunnel.pid");
+const LOG_DIR = path.join(CONFIG_DIR, "logs");
+const SPLIT_EDGE_LOG_FILE = path.join(LOG_DIR, "split-edge.log");
+const SPLIT_LOCAL_LOG_FILE = path.join(LOG_DIR, "split-local.log");
+const MAX_LOG_LINES = 500;
+
+let _logCounts = { edge: 0, local: 0 };
+function _splitLog(kind, msg) {
+  const ts = new Date().toISOString();
+  const line = `${ts} [${kind}] ${msg}\n`;
+  const file = kind === "edge" ? SPLIT_EDGE_LOG_FILE : SPLIT_LOCAL_LOG_FILE;
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.appendFileSync(file, line);
+  } catch {}
+  _logCounts[kind]++;
+  if (_logCounts[kind] % 100 === 0) {
+    try {
+      const lines = fs.readFileSync(file, "utf8").split("\n");
+      if (lines.length > MAX_LOG_LINES + 50) {
+        fs.writeFileSync(file, lines.slice(-MAX_LOG_LINES).join("\n"));
+      }
+    } catch {}
+  }
+}
 // Resolve script path (handle relative paths for sudo)
 const SCRIPT_PATH = (() => {
   try { return fs.realpathSync(process.argv[1]); } catch { return process.argv[1]; }
@@ -357,7 +381,8 @@ function runSplitEdgeDaemon() {
   process.title = "codex-relay-split-edge";
   const cfg = loadConfig();
   const listen = cfg.split?.edge_listen || "127.0.0.1:19090";
-  process.on("uncaughtException", (e) => { try { fs.unlinkSync(SPLIT_EDGE_PID_FILE); } catch {} process.exit(1); });
+  _splitLog("edge", `daemon starting on ${listen}`);
+  process.on("uncaughtException", (e) => { _splitLog("edge", `CRASH: ${e.message}`); try { fs.unlinkSync(SPLIT_EDGE_PID_FILE); } catch {} process.exit(1); });
   const hbInterval = setInterval(() => { try { fs.writeFileSync(SPLIT_EDGE_HB_FILE, String(Date.now())); } catch {} }, 60000);
   const server = startSplitEdge({ listen });
   fs.writeFileSync(SPLIT_EDGE_PID_FILE, String(process.pid));
@@ -368,6 +393,7 @@ function runSplitEdgeDaemon() {
   try { fs.closeSync(1); } catch {}
   try { fs.closeSync(2); } catch {}
   const cleanup = () => {
+    _splitLog("edge", "daemon shutting down");
     clearInterval(hbInterval);
     try { server.close(); } catch {}
     try { fs.unlinkSync(SPLIT_EDGE_PID_FILE); } catch {}
@@ -383,7 +409,8 @@ function runSplitLocalDaemon() {
   const cfg = loadConfig();
   const edgePort = parseListenAddr(cfg.split?.edge_listen || "127.0.0.1:19090").port;
   const listen = cfg.split?.local_listen || "127.0.0.1:18443";
-  process.on("uncaughtException", (e) => { try { fs.unlinkSync(SPLIT_LOCAL_PID_FILE); } catch {} process.exit(1); });
+  _splitLog("local", `daemon starting on ${listen}, edge port ${edgePort}`);
+  process.on("uncaughtException", (e) => { _splitLog("local", `CRASH: ${e.message}`); try { fs.unlinkSync(SPLIT_LOCAL_PID_FILE); } catch {} process.exit(1); });
   const hbInterval = setInterval(() => { try { fs.writeFileSync(SPLIT_LOCAL_HB_FILE, String(Date.now())); } catch {} }, 60000);
   const server = startSplitLocal({ listen, edgeHost: "127.0.0.1", edgePort });
 
@@ -393,13 +420,13 @@ function runSplitLocalDaemon() {
       try {
         const cfg2 = loadConfig();
         if (cfg2.split?.ssh) {
-          info("SSH tunnel died — re-establishing...");
+          _splitLog("local", "SSH tunnel died — re-establishing...");
           try { fs.unlinkSync(SPLIT_TUNNEL_PID_FILE); } catch {}
           const ep = parseListenAddr(cfg2.split.edge_listen || "127.0.0.1:19090").port;
           _ensureSshTunnel(cfg2.split.ssh, ep, cfg2.split.ssh_key);
         }
       } catch (e) {
-        // Keep retrying on next interval — don't crash the daemon
+        _splitLog("local", `tunnel reconnect failed (will retry): ${e.message}`);
       }
     }
   }, 30000);
@@ -412,6 +439,7 @@ function runSplitLocalDaemon() {
   try { fs.closeSync(1); } catch {}
   try { fs.closeSync(2); } catch {}
   const cleanup = () => {
+    _splitLog("local", "daemon shutting down");
     clearInterval(tunnelWatchdog);
     clearInterval(hbInterval);
     try { server.close(); } catch {}
@@ -529,6 +557,7 @@ function _parseSsh(s) {
 
 function _ensureSshTunnel(sshTarget, edgePort, sshKey) {
   if (_tunnelPidAlive()) return;
+  _splitLog("local", `establishing SSH tunnel 127.0.0.1:${edgePort} → ${sshTarget}:${edgePort}`);
   try { fs.unlinkSync(SPLIT_TUNNEL_PID_FILE); } catch {}
 
   const { user, host } = _parseSsh(sshTarget);
@@ -585,11 +614,29 @@ function _ensureSshTunnel(sshTarget, edgePort, sshKey) {
       if (pid) {
         fs.writeFileSync(SPLIT_TUNNEL_PID_FILE, pid);
         info(`SSH tunnel up (pid ${pid})`);
+        _splitLog("local", `SSH tunnel established (pid ${pid})`);
         return;
       }
     } catch {}
   }
+  _splitLog("local", `tunnel not reachable on port ${edgePort} after 3s`);
   throw new Error(`SSH tunnel not reachable on port ${edgePort} after 3s`);
+}
+
+function cmdSplitLogs() {
+  let found = false;
+  for (const kind of ["local", "edge"]) {
+    const file = kind === "edge" ? SPLIT_EDGE_LOG_FILE : SPLIT_LOCAL_LOG_FILE;
+    try {
+      const content = fs.readFileSync(file, "utf8");
+      if (!content.trim()) continue;
+      console.log(`── split ${kind} ──`);
+      process.stdout.write(content);
+      if (!content.endsWith("\n")) console.log("");
+      found = true;
+    } catch {}
+  }
+  if (!found) console.log("(no logs)");
 }
 
 function cmdSplit(args) {
@@ -660,12 +707,16 @@ function cmdSplit(args) {
       }
       break;
 
+    case "logs":
+      cmdSplitLogs();
+      break;
+
     case "check":
       cmdSplitCheck(opts);
       break;
 
     default:
-      die(`usage: ${NAME} split {start|stop|status|check}`);
+      die(`usage: ${NAME} split {start|stop|status|logs|check}`);
   }
 }
 
@@ -1076,6 +1127,7 @@ function printHelp() {
     ${NAME} split start [--edge] [--ssh user@host]   - start split daemon
     ${NAME} split stop                               - stop all split daemons
     ${NAME} split status                             - show daemon status
+    ${NAME} split logs                               - show daemon logs
     ${NAME} split check [--edge 127.0.0.1:19090] [--url URL]  - diagnose split proxy chain
     ${NAME} install [--force]                        - install both codex-relay & codex CLI
     ${NAME} install --update                         - update codex CLI

@@ -116,12 +116,23 @@ codex-relay run chat
 | `split start --ssh user@host` | 后台启动本地代理（自动 SSH 隧道） |
 | `split stop` | 停止所有 split 守护进程和 SSH 隧道 |
 | `split status` | 查看 local、edge、SSH 隧道状态 |
+| `split logs` | 查看守护进程日志 |
 | `split check [--edge <host:port>] [--url URL]` | 端到端诊断 |
+
+### 日志
+
+守护进程运行日志写入 `~/.codex-relay/logs/`：
+- `split-local.log` — 本地代理：启动/停止、SSH 隧道建立/断开/自动重建
+- `split-edge.log` — Edge 代理：启动/停止
+
+通过 `codex-relay split logs` 查看。
 
 ### 生命周期
 
 - `split start --ssh user@host` 自动建立 SSH 隧道并记录 PID
 - 重新启动时检测隧道 PID 是否存活，存活则复用
+- 隧道意外断开后本地守护进程每 30s 自动检测并重建
+- `split stop` 优雅退出：关闭本地代理 → 终止 SSH 隧道 → 清理 PID 文件
 - `split stop` 优雅退出：关闭本地代理 → 终止 SSH 隧道 → 清理 PID 文件
 - 若端口被占用但 PID 已死，自动释放端口并重建隧道
 - `split local stop` 或 Ctrl+C 时优雅退出：关闭本地代理 → 终止 SSH 隧道 → 清理 PID 文件
@@ -190,6 +201,9 @@ codex-relay chat                        # 直接透传（效果相同）
 ├── split-local.pid      # Split local 守护进程 PID
 ├── split-local.heartbeat # Split local 心跳
 ├── split-tunnel.pid     # SSH 隧道进程 PID
+├── logs/                 # 守护进程运行日志
+│   ├── split-edge.log
+│   └── split-local.log
 └── certs/               # Split 代理 CA 证书 & 域名证书缓存
     ├── ca-key.pem
     ├── ca-cert.pem
