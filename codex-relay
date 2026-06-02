@@ -416,18 +416,28 @@ function handleSplitLocalConnection(clientSocket, edgeHost, edgePort) {
       tlsSocket.once("error", () => { try { edgeSocket?.destroy(); } catch {} });
 
       const meta = `X-Target: ${target.host}:${target.port}\r\n\r\n`;
+      let closed = false;
+      const cleanup = () => {
+        if (closed) return; closed = true;
+        try { tlsSocket.destroy(); } catch {}
+        try { edgeSocket.destroy(); } catch {}
+        try { clientSocket.destroy(); } catch {}
+      };
+
       const edgeSocket = net.connect(edgePort, edgeHost, () => {
         edgeSocket.setNoDelay(true);
         edgeSocket.setKeepAlive(true, 30000);
         edgeSocket.write(meta);
-        // Flush buffered data from codex (arrived during TLS handshake)
         for (const p of pending) edgeSocket.write(p);
         pending = null;
         tlsSocket.removeAllListeners("data");
         tlsSocket.pipe(edgeSocket);
         edgeSocket.pipe(tlsSocket);
       });
-      edgeSocket.once("error", () => { try { tlsSocket.destroy(); } catch {} });
+      edgeSocket.on("error", cleanup);
+      tlsSocket.on("error", cleanup);
+      clientSocket.on("error", cleanup);
+      clientSocket.on("end", cleanup);
     } catch (e) {
       try { clientSocket.write("HTTP/1.1 500 Internal Server Error\r\n\r\n"); clientSocket.end(); } catch {}
     }
@@ -465,7 +475,15 @@ function runSplitEdgeDaemon() {
   const listen = cfg.split?.edge_listen || "127.0.0.1:19090";
   const proxyUrl = cfg.split?.edge_proxy || "";
   _splitLog("edge", `daemon starting on ${listen}${proxyUrl ? `, upstream: ${proxyUrl}` : ""}`);
-  process.on("uncaughtException", (e) => { _splitLog("edge", `CRASH: ${e.message}`); try { fs.unlinkSync(SPLIT_EDGE_PID_FILE); } catch {} process.exit(1); });
+  process.on("uncaughtException", (e) => {
+    if (e.message?.includes("EPIPE")) {
+      _splitLog("edge", `pipe broken`);
+      return;
+    }
+    _splitLog("edge", `CRASH: ${e.message}`);
+    try { fs.unlinkSync(SPLIT_EDGE_PID_FILE); } catch {}
+    process.exit(1);
+  });
   const hbInterval = setInterval(() => { try { fs.writeFileSync(SPLIT_EDGE_HB_FILE, String(Date.now())); } catch {} }, 60000);
   const server = startSplitEdge({ listen, proxyUrl });
   fs.writeFileSync(SPLIT_EDGE_PID_FILE, String(process.pid));
@@ -493,7 +511,16 @@ function runSplitLocalDaemon() {
   const edgePort = parseListenAddr(cfg.split?.edge_listen || "127.0.0.1:19090").port;
   const listen = cfg.split?.local_listen || "127.0.0.1:18443";
   _splitLog("local", `daemon starting on ${listen}, edge port ${edgePort}`);
-  process.on("uncaughtException", (e) => { _splitLog("local", `CRASH: ${e.message}`); try { fs.unlinkSync(SPLIT_LOCAL_PID_FILE); } catch {} process.exit(1); });
+  process.on("uncaughtException", (e) => {
+    // EPIPE is recoverable — tunnel died, watchdog will reconnect
+    if (e.message?.includes("EPIPE")) {
+      _splitLog("local", `pipe broken (tunnel down), waiting for watchdog`);
+      return;
+    }
+    _splitLog("local", `CRASH: ${e.message}`);
+    try { fs.unlinkSync(SPLIT_LOCAL_PID_FILE); } catch {}
+    process.exit(1);
+  });
   const hbInterval = setInterval(() => { try { fs.writeFileSync(SPLIT_LOCAL_HB_FILE, String(Date.now())); } catch {} }, 60000);
   const server = startSplitLocal({ listen, edgeHost: "127.0.0.1", edgePort });
 
@@ -1253,7 +1280,19 @@ function cmdRun(args) {
   // Split proxy mode: inject local CA cert so codex trusts TLS-terminated connections
   const caCertPath = path.join(CERT_DIR, "ca-cert.pem");
   if (proxyUrl && (proxyUrl.includes("127.0.0.1") || proxyUrl.includes("localhost")) && fs.existsSync(caCertPath)) {
-    env.NODE_EXTRA_CA_CERTS = caCertPath;
+    // Build combined bundle: system CAs + local CA (codex is Rust, needs OpenSSL env vars)
+    const combinedPath = path.join(CERT_DIR, "combined-ca.pem");
+    try {
+      let combined = fs.readFileSync(caCertPath, "utf8") + "\n";
+      for (const sysPath of ["/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem", "/etc/pki/tls/certs/ca-bundle.crt"]) {
+        try { combined += fs.readFileSync(sysPath, "utf8"); break; } catch {}
+      }
+      fs.writeFileSync(combinedPath, combined);
+    } catch { try { fs.copyFileSync(caCertPath, combinedPath); } catch {} }
+    env.NODE_EXTRA_CA_CERTS = combinedPath;
+    env.SSL_CERT_FILE = combinedPath;       // OpenSSL / Rust TLS
+    env.CURL_CA_BUNDLE = combinedPath;      // curl
+    env.REQUESTS_CA_BUNDLE = combinedPath;  // Python requests
   }
 
   const proc = spawn(codexBin, args, { env, stdio: "inherit" });
