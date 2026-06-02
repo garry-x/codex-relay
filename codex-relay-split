@@ -1,0 +1,25 @@
+#!/usr/bin/env node
+// codex-relay-split — thin wrapper for codex-relay split mode.
+// Usage: codex-relay-split <split-subcommand> [args...]
+// Equivalent to: codex-relay split <split-subcommand> [args...]
+
+const { spawn } = require("child_process");
+const path = require("path");
+const fs = require("fs");
+
+// Find codex-relay script — same directory as this script
+const scriptDir = __dirname;
+const relayScript = path.join(scriptDir, "codex-relay");
+
+if (!fs.existsSync(relayScript)) {
+  console.error("error: codex-relay not found in", scriptDir);
+  process.exit(1);
+}
+
+const args = ["split", ...process.argv.slice(2)];
+const proc = spawn(process.execPath, [relayScript, ...args], { stdio: "inherit" });
+proc.on("close", (code) => process.exit(code || 0));
+proc.on("error", (e) => {
+  console.error("error:", e.message);
+  process.exit(1);
+});
