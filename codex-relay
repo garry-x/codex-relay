@@ -1014,12 +1014,157 @@ function cmdSplit(args) {
       console.log(`${NAME} ${VERSION}`);
       break;
 
+    case "monitor":
+      cmdSplitMonitor();
+      break;
+
     case "check":
       cmdSplitCheck(opts);
       break;
 
     default:
-      die(`usage: ${NAME} split {start|stop|status|logs|proxy|update|version|check}`);
+      die(`usage: ${NAME} split {start|stop|status|logs|proxy|update|version|monitor|check}`);
+  }
+}
+
+function _renderStatus(label, alive, detail) {
+  const icon = alive ? "\x1b[32m●\x1b[0m" : "\x1b[31m●\x1b[0m";
+  const state = alive ? "running" : "stopped";
+  return `${icon} ${label}: ${state}${detail ? ` (${detail})` : ""}`;
+}
+
+function _readErrors(logFile, since, maxLines) {
+  try {
+    const lines = fs.readFileSync(logFile, "utf8").split("\n").filter(Boolean);
+    const recent = [];
+    for (let i = lines.length - 1; i >= 0 && recent.length < maxLines; i--) {
+      const line = lines[i];
+      const tsMatch = line.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})/);
+      if (!tsMatch) continue;
+      if (new Date(tsMatch[1]).getTime() < since) break;
+      if (line.includes("error") || line.includes("fail") || line.includes("CRASH") || line.includes("rejected")) {
+        recent.unshift(line.slice(0, 160));
+      }
+    }
+    return recent;
+  } catch { return []; }
+}
+
+function cmdSplitMonitor() {
+  const readline = require("readline");
+  let running = true;
+
+  // Setup raw mode for keypress handling
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+    process.stdin.on("data", (d) => {
+      if (d.toString() === "q" || d[0] === 3) { // q or Ctrl+C
+        running = false;
+        if (process.stdin.isTTY) process.stdin.setRawMode(false);
+        console.log("\nmonitor stopped.");
+        process.exit(0);
+      }
+    });
+  }
+
+  function tick() {
+    if (!running) return;
+
+    // Clear screen
+    process.stdout.write("\x1b[2J\x1b[H");
+
+    const now = Date.now();
+    const since = now - 300000; // last 5 minutes
+
+    // Header
+    console.log(`\x1b[1mcodex-relay ${VERSION} — split monitor\x1b[0m  (q to quit, refresh 3s)`);
+    console.log(`updated: ${new Date().toISOString()}`);
+    console.log("");
+
+    // Local daemon
+    const localAlive = isSplitLocalRunning();
+    let localDetail = "";
+    if (localAlive) {
+      try {
+        const pid = fs.readFileSync(SPLIT_LOCAL_PID_FILE, "utf8").trim();
+        const hbAge = (() => {
+          try { return `${Math.round((now - parseInt(fs.readFileSync(SPLIT_LOCAL_HB_FILE, "utf8"), 10)) / 1000)}s`; }
+          catch { return "N/A"; }
+        })();
+        localDetail = `pid ${pid}, hb ${hbAge} ago`;
+      } catch {}
+    }
+    console.log(_renderStatus("local", localAlive, localDetail));
+
+    // SSH tunnel
+    const tunnelAlive = _tunnelPidAlive();
+    let tunnelDetail = "";
+    if (tunnelAlive) {
+      try { tunnelDetail = `pid ${fs.readFileSync(SPLIT_TUNNEL_PID_FILE, "utf8").trim()}`; } catch {}
+    }
+    console.log(_renderStatus("tunnel", tunnelAlive, tunnelDetail));
+
+    // Remote edge (check via SSH)
+    let edgeAlive = false;
+    let edgeDetail = "";
+    try {
+      const cfg = loadConfig();
+      if (cfg.split?.ssh) {
+        const keyArg = cfg.split.ssh_key ? ["-i", cfg.split.ssh_key] : [];
+        const out = execSync(`ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${cfg.split.ssh}' "codex-relay split status 2>&1 || true"`, { encoding: "utf8", timeout: 5000, stdio: "pipe" });
+        edgeAlive = out.includes("split edge:  running");
+        if (edgeAlive) {
+          const pm = out.match(/pid (\d+)/);
+          const hm = out.match(/heartbeat:\s+(\S+)/);
+          edgeDetail = `${pm ? "pid "+pm[1] : ""}${hm ? ", hb "+hm[1]+" ago" : ""}`;
+        }
+      } else {
+        edgeDetail = "no SSH config (this is edge machine)";
+        edgeAlive = isSplitEdgeRunning();
+        if (edgeAlive) {
+          try { edgeDetail = `pid ${fs.readFileSync(SPLIT_EDGE_PID_FILE, "utf8").trim()}`; } catch {}
+        }
+      }
+    } catch { edgeDetail = "SSH unreachable"; }
+    console.log(_renderStatus("edge", edgeAlive, edgeDetail));
+
+    console.log("");
+
+    // Proxy config
+    const cfg = loadConfig();
+    if (cfg.split?.edge_proxy) {
+      console.log(`proxy:  ${cfg.split.edge_proxy.replace(/\/\/[^@]+@/, "//***@")}`);
+    } else {
+      console.log("proxy:  (none — direct connect)");
+    }
+    console.log(`ssh:    ${cfg.split?.ssh || "(none — edge mode)"}`);
+
+    console.log("");
+    console.log("\x1b[1m── recent errors (5m) ──\x1b[0m");
+
+    // Show errors from local log
+    const localErrors = _readErrors(SPLIT_LOCAL_LOG_FILE, since, 10);
+    for (const e of localErrors) {
+      console.log(`  \x1b[33mlocal\x1b[0m ${e}`);
+    }
+
+    if (localErrors.length === 0) {
+      console.log("  (no recent errors)");
+    }
+
+    console.log("");
+
+    // Next tick
+    if (running) setTimeout(tick, 3000);
+  }
+
+  // Handle non-TTY mode — just show one snapshot
+  if (!process.stdin.isTTY) {
+    tick();
+  } else {
+    tick();
+    // Keep event loop alive
+    setInterval(() => {}, 60000);
   }
 }
 
