@@ -1296,6 +1296,8 @@ function cmdRun(args) {
         _ensureSshTunnel(cfg.split.ssh, edgePort, cfg.split.ssh_key);
         _splitDaemonStart("local", [SCRIPT_PATH, "--_split-local-daemon"]);
         _ensureRemoteEdge(cfg.split.ssh, cfg.split.ssh_key);
+        // Give the daemon a moment to start listening
+        execSync("sleep 0.5", { stdio: "ignore" });
       } catch (e) {
         info(`auto-start failed: ${e.message} — continuing anyway`);
       }
