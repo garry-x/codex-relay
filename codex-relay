@@ -323,11 +323,11 @@ function handleSplitEdgeConnection(socket, proxyUrl) {
   socket.setKeepAlive(true, 30000);
   let buf = Buffer.alloc(0);
   let targetSocket = null;
-  let connecting = false;  // true while TLS/proxy connection is being established
-
-  function flushRemaining(data) {
-    if (targetSocket && data.length > 0) targetSocket.write(data);
-  }
+  let connecting = false;
+  const reqId = crypto.randomBytes(3).toString("hex");
+  let target = null;
+  const t0 = Date.now();
+  const logE = (msg) => _splitLog("edge", `[${reqId}] ${msg}`);
 
   socket.on("data", (chunk) => {
     if (targetSocket) {
@@ -345,30 +345,35 @@ function handleSplitEdgeConnection(socket, proxyUrl) {
     const metaStr = buf.toString("utf8", 0, metaEnd);
     const m = metaStr.match(/^X-Target:\s*(.+):(\d+)\s*$/im);
     if (!m) {
+      logE(`bad metadata: ${metaStr.slice(0, 50)}`);
       try { socket.write("HTTP/1.1 400 Bad Request\r\n\r\n"); socket.end(); } catch {}
       return;
     }
     const host = m[1].trim();
     const port = parseInt(m[2], 10);
+    target = `${host}:${port}`;
     const remaining = buf.slice(metaEnd + 4);
-    buf = Buffer.alloc(0);  // reset for buffering data during connect
+    buf = Buffer.alloc(0);
     connecting = true;
+    logE(`→ ${target}${proxyUrl ? " via proxy" : " direct"}`);
 
     const proxy = _parseEdgeProxy(proxyUrl);
     if (proxy) {
-      _splitLog("edge", `proxy connect to ${host}:${port} via ${proxyUrl}`);
       const proxySock = _edgeConnectViaProxy(host, port, proxy, (tlsSock) => {
         tlsSock.setNoDelay(true);
         tlsSock.setKeepAlive(true, 30000);
         targetSocket = tlsSock;
         connecting = false;
+        logE(`${target} connected (${Date.now()-t0}ms)`);
         if (remaining.length > 0) tlsSock.write(remaining);
         if (buf.length > 0) { tlsSock.write(buf); buf = Buffer.alloc(0); }
         socket.pipe(tlsSock);
         tlsSock.pipe(socket);
-        tlsSock.on("end", () => { try { socket.end(); } catch {} });
+        tlsSock.on("end", () => { logE(`${target} upstream ended`); try { socket.end(); } catch {} });
+        tlsSock.on("error", (e) => { logE(`${target} TLS pipe: ${e.message}`); });
       });
-      proxySock.once("error", () => {
+      proxySock.once("error", (e) => {
+        logE(`${target} proxy fail: ${e.message}`);
         try { socket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"); socket.end(); } catch {}
       });
       return;
@@ -380,19 +385,28 @@ function handleSplitEdgeConnection(socket, proxyUrl) {
       tlsSock.setKeepAlive(true, 30000);
       targetSocket = tlsSock;
       connecting = false;
+      logE(`${target} connected (${Date.now()-t0}ms)`);
       if (remaining.length > 0) tlsSock.write(remaining);
       if (buf.length > 0) { tlsSock.write(buf); buf = Buffer.alloc(0); }
       socket.pipe(tlsSock);
       tlsSock.pipe(socket);
-      tlsSock.on("end", () => { try { socket.end(); } catch {} });
+      tlsSock.on("end", () => { logE(`${target} upstream ended`); try { socket.end(); } catch {} });
+      tlsSock.on("error", (e) => { logE(`${target} TLS pipe: ${e.message}`); });
     });
-    tlsSock.once("error", () => {
+    tlsSock.once("error", (e) => {
+      logE(`${target} connect fail: ${e.message}`);
       try { socket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"); socket.end(); } catch {}
     });
   });
 
-  socket.on("error", () => { try { targetSocket?.destroy(); } catch {} });
-  socket.on("end", () => { try { targetSocket?.end(); } catch {} });
+  socket.on("error", (e) => {
+    logE(`${target || "?"} client error: ${e.message}`);
+    try { targetSocket?.destroy(); } catch {}
+  });
+  socket.on("end", () => {
+    logE(`${target || "?"} client closed (${Date.now()-t0}ms)`);
+    try { targetSocket?.end(); } catch {}
+  });
 }
 
 function startSplitEdge(opts) {
@@ -411,13 +425,18 @@ function startSplitEdge(opts) {
 
 function handleSplitLocalConnection(clientSocket, edgeHost, edgePort) {
   clientSocket.setNoDelay(true);
+  const rid = crypto.randomBytes(3).toString("hex");
+  const t0 = Date.now();
+  const logL = (msg) => _splitLog("local", `[${rid}] ${msg}`);
   clientSocket.once("data", (head) => {
     const headStr = head.toString();
     const target = connectTargetFromHead(headStr);
     if (!target) {
+      logL(`bad request: ${headStr.slice(0, 50)}`);
       try { clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n"); clientSocket.end(); } catch {}
       return;
     }
+    logL(`→ ${target.host}:${target.port}`);
     try {
       const ctx = getSplitSecureContext(target.host);
       clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
@@ -428,12 +447,13 @@ function handleSplitLocalConnection(clientSocket, edgeHost, edgePort) {
       });
       let pending = [];
       tlsSocket.on("data", (d) => { pending.push(d); });
-      tlsSocket.once("error", () => { try { edgeSocket?.destroy(); } catch {} });
+      tlsSocket.once("error", () => { logL(`tls error`); try { edgeSocket?.destroy(); } catch {} });
 
       const meta = `X-Target: ${target.host}:${target.port}\r\n\r\n`;
       let closed = false;
       const cleanup = () => {
         if (closed) return; closed = true;
+        logL(`${target.host}:${target.port} closed (${Date.now()-t0}ms)`);
         try { tlsSocket.destroy(); } catch {}
         try { edgeSocket.destroy(); } catch {}
         try { clientSocket.destroy(); } catch {}
@@ -448,16 +468,18 @@ function handleSplitLocalConnection(clientSocket, edgeHost, edgePort) {
         tlsSocket.removeAllListeners("data");
         tlsSocket.pipe(edgeSocket);
         edgeSocket.pipe(tlsSocket);
+        logL(`${target.host}:${target.port} connected (${Date.now()-t0}ms)`);
       });
-      edgeSocket.on("error", cleanup);
-      tlsSocket.on("error", cleanup);
-      clientSocket.on("error", cleanup);
-      clientSocket.on("end", cleanup);
+      edgeSocket.on("error", (e) => { logL(`edge: ${e.message}`); cleanup(); });
+      tlsSocket.on("error", (e) => { logL(`tls pipe: ${e.message}`); cleanup(); });
+      clientSocket.on("error", (e) => { logL(`client: ${e.message}`); cleanup(); });
+      clientSocket.on("end", () => { logL(`client ended (${Date.now()-t0}ms)`); cleanup(); });
     } catch (e) {
+      logL(`setup error: ${e.message}`);
       try { clientSocket.write("HTTP/1.1 500 Internal Server Error\r\n\r\n"); clientSocket.end(); } catch {}
     }
   });
-  clientSocket.on("error", () => {});
+  clientSocket.on("error", (e) => { _splitLog("local", `[${rid}] early client error: ${e.message}`); });
 }
 
 function startSplitLocal(opts) {
