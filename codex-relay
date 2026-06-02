@@ -1287,7 +1287,22 @@ function cmdRun(args) {
     info(`using proxy: ${proxyUrl}`);
   }
 
-  // Split proxy mode: inject local CA cert so codex trusts TLS-terminated connections
+  // Split proxy mode: auto-start daemon if using local split proxy
+  if (proxyUrl && (proxyUrl.includes("127.0.0.1") || proxyUrl.includes("localhost"))) {
+    if (!isSplitLocalRunning() && cfg.split?.ssh) {
+      info("split proxy not running — auto-starting...");
+      try {
+        const edgePort = parseListenAddr(cfg.split.edge_listen || "127.0.0.1:19090").port;
+        _ensureSshTunnel(cfg.split.ssh, edgePort, cfg.split.ssh_key);
+        _splitDaemonStart("local", [SCRIPT_PATH, "--_split-local-daemon"]);
+        _ensureRemoteEdge(cfg.split.ssh, cfg.split.ssh_key);
+      } catch (e) {
+        info(`auto-start failed: ${e.message} — continuing anyway`);
+      }
+    }
+  }
+
+  // Inject local CA cert so codex trusts TLS-terminated connections
   const caCertPath = path.join(CERT_DIR, "ca-cert.pem");
   if (proxyUrl && (proxyUrl.includes("127.0.0.1") || proxyUrl.includes("localhost")) && fs.existsSync(caCertPath)) {
     // Build combined bundle: system CAs + local CA (codex is Rust, needs OpenSSL env vars)
