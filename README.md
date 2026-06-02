@@ -189,7 +189,7 @@ codex-relay split local status
 # 3. 诊断验证
 codex-relay split check
 
-# 3. 通过代理运行 codex
+# 4. 通过代理运行 codex
 codex-relay run chat
 ```
 
@@ -288,7 +288,9 @@ codex-relay chat                        # 直接透传（效果相同）
 ├── chain.log            # 链式中转请求日志
 ├── chain.heartbeat      # 链式中转心跳
 ├── split-edge.pid       # Split edge 守护进程 PID
+├── split-edge.heartbeat # Split edge 心跳
 ├── split-local.pid      # Split local 守护进程 PID
+├── split-local.heartbeat # Split local 心跳
 ├── split-tunnel.pid     # SSH 隧道进程 PID
 └── certs/               # Split 代理 CA 证书 & 域名证书缓存
     ├── ca-key.pem
