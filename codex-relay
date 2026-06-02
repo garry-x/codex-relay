@@ -452,7 +452,13 @@ function _vpsExec(cmd) {
   const dest = process.argv.includes("--ssh") ? process.argv[process.argv.indexOf("--ssh") + 1] : cfg.vps?.ssh;
   if (!dest) die("no VPS configured. Run: codex-relay vps setup <user@host>");
   const keyArg = cfg.vps?.key ? ["-i", cfg.vps.key] : [];
-  return execSync(`ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${dest}' ${JSON.stringify(cmd)}`, { encoding: "utf8", timeout: 15000, stdio: "pipe" });
+  const sshArgs = `-o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")}`.trim();
+  try {
+    return execSync(`ssh ${sshArgs} '${dest}' ${JSON.stringify(cmd + "; true")}`, { encoding: "utf8", timeout: 15000, stdio: "pipe" });
+  } catch (e) {
+    // Always return combined output regardless of exit code
+    return (e.stdout || "") + (e.stderr || "");
+  }
 }
 
 function _vpsExecNoFail(cmd) {
@@ -489,11 +495,11 @@ function cmdVpsSetup(target) {
   try { execSync(deployCmd, { encoding: "utf8", timeout: 15000, stdio: "pipe" }); }
   catch (e) { die(`deploy failed: ${e.message}`); }
 
-  // Start forwarder
+  // Start forwarder via ssh -f (fully detached)
   try {
-    const out = _vpsExec("pkill -f codex-relay-forward 2>/dev/null; sleep 0.5; nohup codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1 & for i in 1 2 3 4 5; do sleep 0.5; ss -tlnp | grep -q 8443 && break; done; ss -tlnp | grep 8443 || echo 'FAILED'");
-    info(out.trim());
-  } catch (e) { info(`start failed — run codex-relay vps start`); }
+    execSync(`ssh -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${target}' "pkill -f codex-relay-forward 2>/dev/null; sleep 0.5"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" });
+    execSync(`ssh -f -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${target}' "codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" });
+  } catch (e) { info(`start via ssh failed — run codex-relay vps start`); }
 
   info("VPS setup complete.");
 }
@@ -512,9 +518,26 @@ function cmdVpsProxy(action, url) {
 }
 
 function cmdVpsStart() {
-  const out = _vpsExec("pkill -f codex-relay-forward 2>/dev/null; sleep 0.5; nohup codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1 & for i in 1 2 3 4 5; do sleep 0.5; ss -tlnp | grep -q 8443 && break; done; ss -tlnp | grep 8443 || echo 'FAILED'");
-  if (out.includes("FAILED")) die("VPS forwarder failed to start. Check: ssh vps \"cat /tmp/codex-relay-forward.log\"");
-  info(`VPS forwarder started:\n${out.trim()}`);
+  const cfg = loadConfig();
+  const dest = cfg.vps?.ssh;
+  if (!dest) die("no VPS configured. Run: codex-relay vps setup <user@host>");
+  const keyArg = cfg.vps?.key ? ["-i", cfg.vps.key] : [];
+  const sshArgs = `-o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")}`.trim();
+
+  // Kill old, start new via ssh -f (fully detached)
+  try { execSync(`ssh ${sshArgs} '${dest}' "pkill -f codex-relay-forward 2>/dev/null; sleep 0.5"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" }); } catch {}
+  try { execSync(`ssh -f ${sshArgs} '${dest}' "codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" }); } catch {}
+
+  // Wait and check
+  for (let i = 0; i < 5; i++) {
+    execSync("sleep 0.5", { stdio: "ignore" });
+    const status = _vpsExecNoFail("ss -tlnp | grep 8443");
+    if (status.trim()) {
+      info(`VPS forwarder started:\n${status.trim()}`);
+      return;
+    }
+  }
+  die("VPS forwarder failed to start. Check: ssh vps \"cat /tmp/codex-relay-forward.log\"");
 }
 
 function cmdVpsStop() {
