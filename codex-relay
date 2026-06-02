@@ -40,6 +40,7 @@ const SPLIT_EDGE_PID_FILE = path.join(CONFIG_DIR, "split-edge.pid");
 const SPLIT_EDGE_HB_FILE = path.join(CONFIG_DIR, "split-edge.heartbeat");
 const SPLIT_LOCAL_PID_FILE = path.join(CONFIG_DIR, "split-local.pid");
 const SPLIT_LOCAL_HB_FILE = path.join(CONFIG_DIR, "split-local.heartbeat");
+const SPLIT_TUNNEL_PID_FILE = path.join(CONFIG_DIR, "split-tunnel.pid");
 const MAX_LOG_LINES = 500;
 
 let _logCount = 0;
@@ -972,9 +973,31 @@ function _splitDaemonStatus(kind) {
   console.log(`  heartbeat:   ${hbAge}`);
 }
 
+function _tunnelPidAlive() {
+  try {
+    const pid = parseInt(fs.readFileSync(SPLIT_TUNNEL_PID_FILE, "utf8").trim(), 10);
+    if (!pid) return false;
+    process.kill(pid, 0); // throws if not alive
+    return true;
+  } catch { return false; }
+}
+
 function _ensureSshTunnel(host, edgePort, opts) {
+  // Check saved PID first — if alive, tunnel likely still up
+  if (_tunnelPidAlive()) return;
+
+  // Clean up stale PID file
+  try { fs.unlinkSync(SPLIT_TUNNEL_PID_FILE); } catch {}
+
   const user = opts.user || "root";
   const keyArg = opts.key ? ["-i", opts.key] : [];
+  info(`establishing SSH tunnel: 127.0.0.1:${edgePort} → ${host}:${edgePort}`);
+
+  // Ensure port is free (kill stale ssh on that port)
+  try {
+    execSync(`fuser -k ${edgePort}/tcp 2>/dev/null`, { encoding: "utf8", timeout: 3000 });
+  } catch {}
+
   const sshArgs = [
     "-o", "StrictHostKeyChecking=no",
     "-o", "ServerAliveInterval=60",
@@ -984,17 +1007,27 @@ function _ensureSshTunnel(host, edgePort, opts) {
     ...keyArg,
     `${user}@${host}`,
   ];
-  info(`auto SSH tunnel: localhost:${edgePort} → ${host}:${edgePort}`);
   try {
     execSync(`ssh ${sshArgs.map((a) => `'${a}'`).join(" ")} 2>&1`, { encoding: "utf8", timeout: 15000, stdio: "pipe" });
   } catch (e) {
     const msg = (e.stderr || e.stdout || e.message || "").toString();
-    // Already bound = tunnel likely already exists from a previous process
-    if (msg.includes("ddress already in use") || msg.includes("bind")) return;
     die(`ssh tunnel failed: ${msg.trim()}`);
   }
-  // Give ssh -f a moment to background
-  execSync("sleep 0.5", { stdio: "ignore" });
+
+  // Wait for tunnel to come up, then record PID
+  for (let i = 0; i < 20; i++) {
+    execSync("sleep 0.15", { stdio: "ignore" });
+    try {
+      const out = execSync(`fuser ${edgePort}/tcp 2>/dev/null`, { encoding: "utf8", timeout: 2000 }).trim();
+      const pid = out.split(/\s+/).filter(Boolean).pop();
+      if (pid) {
+        fs.writeFileSync(SPLIT_TUNNEL_PID_FILE, pid);
+        info(`SSH tunnel up (pid ${pid})`);
+        return;
+      }
+    } catch {}
+  }
+  die(`SSH tunnel not reachable on port ${edgePort} after 3s`);
 }
 
 function cmdSplit(args) {
