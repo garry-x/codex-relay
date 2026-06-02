@@ -14,6 +14,7 @@ const { spawn, execSync } = require("child_process");
 
 const NAME = "codex-relay";
 const VERSION = "0.2.0";
+const UPDATE_URL = "https://raw.githubusercontent.com/garry-x/codex-relay/main/codex-relay";
 
 // When running via sudo, use the original user's home, not /var/root
 const SUDO_USER = process.env.SUDO_USER;
@@ -474,6 +475,53 @@ function startSplitLocal(opts) {
   return server;
 }
 
+// ── self-update ────────────────────────────────────────────────────────────
+
+async function _checkUpdate(scriptPath, restart = false) {
+  // Throttle: only check once per hour
+  const lastCheckFile = path.join(CONFIG_DIR, ".last_update_check");
+  try {
+    const lastCheck = parseInt(fs.readFileSync(lastCheckFile, "utf8"), 10);
+    if (Date.now() - lastCheck < 3600000) return;
+  } catch {}
+  try { fs.writeFileSync(lastCheckFile, String(Date.now())); } catch {}
+
+  let remoteVersion = "";
+  try {
+    const resp = await fetch(UPDATE_URL, { signal: AbortSignal.timeout(10000) });
+    if (!resp.ok) return;
+    const text = await resp.text();
+    const m = text.match(/const VERSION\s*=\s*"([^"]+)"/);
+    if (!m) return;
+    remoteVersion = m[1];
+  } catch {
+    return;
+  }
+
+  if (remoteVersion === VERSION) return;
+
+  info(`new version ${remoteVersion} available (current: ${VERSION}) — updating...`);
+  _splitLog("edge", `new version ${remoteVersion} available (current: ${VERSION}) — updating...`);
+  try {
+    const resp = await fetch(UPDATE_URL, { signal: AbortSignal.timeout(30000) });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const newScript = await resp.text();
+    if (!newScript.includes(`"${remoteVersion}"`)) throw new Error("version mismatch");
+    fs.writeFileSync(scriptPath, newScript, { mode: 0o755 });
+    _splitLog("edge", `updated to ${remoteVersion}`);
+    info(`updated to ${remoteVersion}`);
+    if (restart) {
+      _splitLog("edge", "restarting...");
+      const child = spawn(process.execPath, [scriptPath, "--_split-edge-daemon"], { detached: true, stdio: "ignore" });
+      child.unref();
+      process.exit(0);
+    }
+  } catch (e) {
+    _splitLog("edge", `update failed: ${e.message}`);
+    info(`update failed: ${e.message}`);
+  }
+}
+
 // ── split proxy: daemon management ─────────────────────────────────────────
 
 function isSplitEdgeRunning() {
@@ -489,6 +537,9 @@ function runSplitEdgeDaemon() {
   const listen = cfg.split?.edge_listen || "127.0.0.1:19090";
   const proxyUrl = cfg.split?.edge_proxy || "";
   _splitLog("edge", `daemon starting on ${listen}${proxyUrl ? `, upstream: ${proxyUrl}` : ""}`);
+
+  // Check for updates in background (restarts daemon if updated)
+  _checkUpdate(SCRIPT_PATH, true);
   process.on("uncaughtException", (e) => {
     if (e.message?.includes("EPIPE")) {
       _splitLog("edge", `pipe broken`);
@@ -809,6 +860,9 @@ function cmdSplit(args) {
 
   switch (action) {
     case "start": {
+      // Background update check (fire-and-forget, throttled to 1/hr)
+      _checkUpdate(SCRIPT_PATH, false);
+
       if (sshTarget) {
         // Local mode: start local proxy with SSH tunnel + remote edge
         const cfg = loadConfig();
@@ -915,12 +969,21 @@ function cmdSplit(args) {
       break;
     }
 
+    case "update":
+      info("checking for updates...");
+      _checkUpdate(SCRIPT_PATH, false).then(() => {
+        info("update check complete.");
+      }).catch((e) => {
+        info(`update check failed: ${e.message}`);
+      });
+      break;
+
     case "check":
       cmdSplitCheck(opts);
       break;
 
     default:
-      die(`usage: ${NAME} split {start|stop|status|logs|proxy|check}`);
+      die(`usage: ${NAME} split {start|stop|status|logs|proxy|update|check}`);
   }
 }
 
