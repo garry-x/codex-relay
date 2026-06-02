@@ -1,0 +1,110 @@
+#!/usr/bin/env node
+// codex-relay-forward — VPS TCP CONNECT forwarder.
+// Listens for HTTP CONNECT requests and forwards them through an upstream
+// static proxy. Designed to run on a VPS reachable via Tailscale/WireGuard.
+// Requires Node.js >= 18 (no npm dependencies).
+//
+// Usage:
+//   codex-relay-forward                             # reads proxy from config.json
+//   codex-relay-forward 100.114.41.104:8443         # custom listen addr
+//   codex-relay-forward 0.0.0.0:8443 http://proxy:8080  # full custom
+//
+// Env vars:
+//   FORWARD_LISTEN   listen address (default 0.0.0.0:8443)
+//   FORWARD_PROXY    upstream proxy URL (overrides config.json)
+
+const net = require("net");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+
+// ── config ─────────────────────────────────────────────────────────────────
+
+const CONFIG_FILE = path.join(os.homedir(), ".codex-relay", "config.json");
+function loadConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")); } catch { return {}; }
+}
+
+const LISTEN = process.argv[2] || process.env.FORWARD_LISTEN || "0.0.0.0:8443";
+const PROXY_URL = process.argv[3] || process.env.FORWARD_PROXY ||
+                  loadConfig().https || loadConfig().http;
+
+if (!PROXY_URL) {
+  console.error("error: no upstream proxy configured. Set FORWARD_PROXY env var,");
+  console.error("  pass as CLI arg, or configure http/https in " + CONFIG_FILE);
+  process.exit(1);
+}
+
+// ── helpers ────────────────────────────────────────────────────────────────
+
+function parseAddr(val) {
+  const i = val.lastIndexOf(":");
+  return { host: i > 0 ? val.slice(0, i) : "0.0.0.0", port: parseInt(val.slice(i + 1), 10) || 8080 };
+}
+
+function parseProxy(url) {
+  const s = url.replace(/^https?:\/\//, "");
+  const at = s.lastIndexOf("@");
+  const auth = at >= 0 ? s.slice(0, at) : "";
+  const hp = at >= 0 ? s.slice(at + 1) : s;
+  const ci = hp.lastIndexOf(":");
+  return {
+    host: ci >= 0 ? hp.slice(0, ci) : hp,
+    port: ci >= 0 ? parseInt(hp.slice(ci + 1), 10) : 8080,
+    b64: auth ? Buffer.from(auth).toString("base64") : "",
+  };
+}
+
+const addr = parseAddr(LISTEN);
+const proxy = parseProxy(PROXY_URL);
+const REDACTED = PROXY_URL.replace(/\/\/[^@]+@/, "//***@");
+
+// ── server ─────────────────────────────────────────────────────────────────
+
+const server = net.createServer((client) => {
+  client.setNoDelay(true);
+  client.once("data", (buf) => {
+    const head = buf.toString();
+    const m = head.match(/^CONNECT\s+(\S+):(\d+)\s+HTTP\//i);
+    if (!m) { client.end("HTTP/1.1 400 Bad Request\r\n\r\n"); return; }
+
+    const target = `${m[1]}:${m[2]}`;
+    const upstream = net.connect(proxy.port, proxy.host, () => {
+      let req = `CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n`;
+      if (proxy.b64) req += `Proxy-Authorization: Basic ${proxy.b64}\r\n`;
+      req += "\r\n";
+      upstream.write(req);
+    });
+    upstream.setNoDelay(true);
+
+    let resp = Buffer.alloc(0);
+    let done = false;
+    upstream.on("data", (d) => {
+      if (done) return;
+      resp = Buffer.concat([resp, d]);
+      const eoh = resp.indexOf("\r\n\r\n");
+      if (eoh === -1) return;
+      done = true;
+      upstream.removeAllListeners("data");
+
+      if (!resp.toString("utf8", 0, resp.indexOf("\r\n")).includes("200")) {
+        client.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        upstream.destroy();
+        return;
+      }
+
+      client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      const leftover = resp.slice(eoh + 4);
+      if (leftover.length) upstream.unshift(leftover);
+      client.pipe(upstream);
+      upstream.pipe(client);
+    });
+    upstream.on("error", () => { try { client.destroy(); } catch {} });
+    client.on("error", () => { try { upstream.destroy(); } catch {} });
+  });
+  client.on("error", () => {});
+});
+
+server.listen(addr.port, addr.host, () => {
+  console.error(`[codex-relay-forward] ${addr.host}:${addr.port} → ${REDACTED}`);
+});

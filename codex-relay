@@ -2,29 +2,22 @@
 // codex-relay — Node.js wrapper for OpenAI Codex CLI with proxy support.
 // Requires Node.js >= 18 (built-in fetch, no npm dependencies).
 
-const net = require("net");
-const tls = require("tls");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const crypto = require("crypto");
 const { spawn, execSync } = require("child_process");
 
-// ── config ─────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// config
+// ═══════════════════════════════════════════════════════════════════════════
 
 const NAME = "codex-relay";
-const VERSION = "0.3.0";
-const UPDATE_URL = "https://raw.githubusercontent.com/garry-x/codex-relay/main/codex-relay";
+const VERSION = "0.4.0";
 
 // When running via sudo, use the original user's home, not /var/root
 const SUDO_USER = process.env.SUDO_USER;
 const REAL_HOME = (() => {
   if (!SUDO_USER) return os.homedir();
-  try {
-    const info = require("os").userInfo({ encoding: "utf8" });
-    // macOS: userInfo doesn't take options; try to resolve from /Users or /home
-  } catch {}
-  // Heuristic: check common home dir patterns
   for (const prefix of ["/Users", "/home"]) {
     const candidate = path.join(prefix, SUDO_USER);
     try { if (fs.statSync(candidate).isDirectory()) return candidate; } catch {}
@@ -33,42 +26,15 @@ const REAL_HOME = (() => {
 })();
 const CONFIG_DIR = path.join(REAL_HOME, ".codex-relay");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
-const CERT_DIR = path.join(CONFIG_DIR, "certs");
-const SPLIT_EDGE_PID_FILE = path.join(CONFIG_DIR, "split-edge.pid");
-const SPLIT_EDGE_HB_FILE = path.join(CONFIG_DIR, "split-edge.heartbeat");
-const SPLIT_LOCAL_PID_FILE = path.join(CONFIG_DIR, "split-local.pid");
-const SPLIT_LOCAL_HB_FILE = path.join(CONFIG_DIR, "split-local.heartbeat");
-const SPLIT_TUNNEL_PID_FILE = path.join(CONFIG_DIR, "split-tunnel.pid");
-const LOG_DIR = path.join(CONFIG_DIR, "logs");
-const SPLIT_EDGE_LOG_FILE = path.join(LOG_DIR, "split-edge.log");
-const SPLIT_LOCAL_LOG_FILE = path.join(LOG_DIR, "split-local.log");
-const MAX_LOG_LINES = 500;
 
-let _logCounts = { edge: 0, local: 0 };
-function _splitLog(kind, msg) {
-  const ts = new Date().toISOString();
-  const line = `${ts} [${kind}] ${msg}\n`;
-  const file = kind === "edge" ? SPLIT_EDGE_LOG_FILE : SPLIT_LOCAL_LOG_FILE;
-  try {
-    fs.mkdirSync(LOG_DIR, { recursive: true });
-    fs.appendFileSync(file, line);
-  } catch {}
-  _logCounts[kind]++;
-  if (_logCounts[kind] % 100 === 0) {
-    try {
-      const lines = fs.readFileSync(file, "utf8").split("\n");
-      if (lines.length > MAX_LOG_LINES + 50) {
-        fs.writeFileSync(file, lines.slice(-MAX_LOG_LINES).join("\n"));
-      }
-    } catch {}
-  }
-}
 // Resolve script path (handle relative paths for sudo)
 const SCRIPT_PATH = (() => {
   try { return fs.realpathSync(process.argv[1]); } catch { return process.argv[1]; }
 })();
 
-// ── helpers ────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// helpers
+// ═══════════════════════════════════════════════════════════════════════════
 
 function die(msg) {
   console.error(`error: ${msg}`);
@@ -85,80 +51,6 @@ function saveConfig(cfg) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
 }
-// ── split proxy: certificate management ────────────────────────────────────
-
-function shorthash(s) {
-  return crypto.createHash("sha256").update(s).digest("hex").slice(0, 16);
-}
-
-function ensureSplitCACert() {
-  fs.mkdirSync(CERT_DIR, { recursive: true });
-  const caKeyPath = path.join(CERT_DIR, "ca-key.pem");
-  const caCertPath = path.join(CERT_DIR, "ca-cert.pem");
-  if (fs.existsSync(caKeyPath) && fs.existsSync(caCertPath)) {
-    return { key: fs.readFileSync(caKeyPath, "utf8"), cert: fs.readFileSync(caCertPath, "utf8"), certPath: caCertPath };
-  }
-  if (!shutil("openssl")) die("openssl is required for split proxy mode. Install: apt install openssl");
-  execSync(
-    `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 ` +
-    `-days 3650 -nodes -keyout '${caKeyPath}' -out '${caCertPath}' ` +
-    `-subj '/CN=CodexRelayLocalCA' 2>/dev/null`,
-    { encoding: "utf8", timeout: 10000 }
-  );
-  // Verify generation
-  try { execSync(`openssl verify -CAfile '${caCertPath}' '${caCertPath}' 2>/dev/null`, { encoding: "utf8" }); } catch {
-    die("openssl CA cert generation failed — check openssl installation");
-  }
-  info(`split proxy CA generated at ${caCertPath}`);
-  return { key: fs.readFileSync(caKeyPath, "utf8"), cert: fs.readFileSync(caCertPath, "utf8"), certPath: caCertPath };
-}
-
-function getSplitDomainCert(hostname) {
-  const domainDir = path.join(CERT_DIR, shorthash(hostname));
-  const keyPath = path.join(domainDir, "key.pem");
-  const certPath = path.join(domainDir, "cert.pem");
-  if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
-    return { key: fs.readFileSync(keyPath, "utf8"), cert: fs.readFileSync(certPath, "utf8") };
-  }
-  fs.mkdirSync(domainDir, { recursive: true });
-  const ca = ensureSplitCACert();
-  // Write CA files to domain dir for openssl (needs file paths)
-  const caKeyPath = path.join(CERT_DIR, "ca-key.pem");
-  const caCertPath = path.join(CERT_DIR, "ca-cert.pem");
-  // Generate domain key
-  execSync(
-    `openssl ecparam -genkey -name prime256v1 -noout -out '${keyPath}' 2>/dev/null`,
-    { encoding: "utf8", timeout: 5000 }
-  );
-  // Generate CSR with SAN
-  const csrPath = path.join(domainDir, "domain.csr");
-  execSync(
-    `openssl req -new -key '${keyPath}' -out '${csrPath}' ` +
-    `-subj "/CN=${hostname}" -addext "subjectAltName=DNS:${hostname}" 2>/dev/null`,
-    { encoding: "utf8", timeout: 5000 }
-  );
-  // Sign with CA
-  execSync(
-    `openssl x509 -req -in '${csrPath}' ` +
-    `-CA '${caCertPath}' -CAkey '${caKeyPath}' -CAcreateserial ` +
-    `-out '${certPath}' -days 365 -sha256 ` +
-    `-extfile <(printf "subjectAltName=DNS:${hostname}\\n") 2>/dev/null`,
-    { encoding: "utf8", shell: "/bin/bash", timeout: 5000 }
-  );
-  // Clean up CSR
-  try { fs.unlinkSync(csrPath); } catch {}
-  return { key: fs.readFileSync(keyPath, "utf8"), cert: fs.readFileSync(certPath, "utf8") };
-}
-
-const _splitCtxCache = new Map();
-function getSplitSecureContext(hostname) {
-  let ctx = _splitCtxCache.get(hostname);
-  if (ctx) return ctx;
-  const { key, cert } = getSplitDomainCert(hostname);
-  ctx = tls.createSecureContext({ key, cert });
-  _splitCtxCache.set(hostname, ctx);
-  return ctx;
-}
 
 function findCodex() {
   try { return execSync("which codex", { encoding: "utf8" }).trim(); } catch { return null; }
@@ -169,19 +61,20 @@ function codexVersion() {
   try { return execSync(`"${bin}" --version`, { encoding: "utf8", timeout: 5000 }).trim(); } catch { return null; }
 }
 
+function shutil(name) {
+  try { execSync(`which ${name}`, { encoding: "utf8", stdio: "ignore" }); return true; } catch { return false; }
+}
+
 // Detect the shell config file for PATH setup.
-// Returns { rc: absolute path, name: display name, home: user home dir }.
 function detectShellRc() {
   let shell = process.env.SHELL || "";
   let home = os.homedir();
 
-  // When running via sudo, resolve the original user's data
   if (SUDO_USER) {
     for (const prefix of ["/Users", "/home"]) {
       const candidate = path.join(prefix, SUDO_USER);
       try { if (fs.statSync(candidate).isDirectory()) { home = candidate; break; } } catch {}
     }
-    // Get original user's shell
     try {
       if (process.platform === "darwin") {
         const out = execSync(`dscl . -read /Users/${SUDO_USER} UserShell 2>/dev/null`, { encoding: "utf8", timeout: 2000 });
@@ -195,12 +88,8 @@ function detectShellRc() {
 
   const isBash = shell.includes("bash");
   const isZsh = shell.includes("zsh");
-
-  if (isZsh) {
-    return { rc: path.join(home, ".zshrc"), name: "~/.zshrc", home };
-  }
+  if (isZsh) return { rc: path.join(home, ".zshrc"), name: "~/.zshrc", home };
   if (isBash) {
-    // macOS bash sources .bash_profile for login shells; Linux uses .bashrc
     const bashProfile = path.join(home, ".bash_profile");
     if (fs.existsSync(bashProfile) || process.platform === "darwin") {
       return { rc: bashProfile, name: "~/.bash_profile", home };
@@ -210,505 +99,9 @@ function detectShellRc() {
   return { rc: path.join(home, ".profile"), name: "~/.profile", home };
 }
 
-function parseListenAddr(value) {
-  const input = value || "127.0.0.1:8080";
-  const idx = input.lastIndexOf(":");
-  if (idx < 0) return { host: input, port: 8080 };
-  const host = input.slice(0, idx) || "0.0.0.0";
-  const port = parseInt(input.slice(idx + 1), 10);
-  if (!port) die(`invalid listen address: ${input}`);
-  return { host, port };
-}
-
-function connectTargetFromHead(headStr) {
-  const firstSpace = headStr.indexOf(" ");
-  if (firstSpace === -1) return null;
-  const method = headStr.slice(0, firstSpace);
-
-  if (method === "CONNECT") {
-    const hostStart = firstSpace + 1;
-    const hostEnd = headStr.indexOf(" ", hostStart);
-    if (hostEnd === -1) return null;
-    const hostPort = headStr.slice(hostStart, hostEnd);
-    const colonIdx = hostPort.lastIndexOf(":");
-    if (colonIdx === -1) return null;
-    return {
-      mode: "connect",
-      host: hostPort.slice(0, colonIdx),
-      port: parseInt(hostPort.slice(colonIdx + 1), 10),
-    };
-  }
-
-  const urlStart = firstSpace + 1;
-  const urlEnd = headStr.indexOf(" ", urlStart);
-  if (urlEnd === -1) return null;
-  const url = headStr.slice(urlStart, urlEnd);
-  if (!url.startsWith("http://")) return null;
-
-  const hostStart = 7;
-  const pathStart = url.indexOf("/", hostStart);
-  const hostPortPart = pathStart === -1 ? url.slice(hostStart) : url.slice(hostStart, pathStart);
-  const colonIdx = hostPortPart.indexOf(":");
-  const host2 = colonIdx === -1 ? hostPortPart : hostPortPart.slice(0, colonIdx);
-  const port = colonIdx === -1 ? 80 : parseInt(hostPortPart.slice(colonIdx + 1), 10);
-  const path = pathStart === -1 ? "/" : url.slice(pathStart);
-
-  return { mode: "http", host: host2, port, method, path };
-}
-
-// ── split proxy: edge server (VPS side) ────────────────────────────────────
-
-// Parse proxy URL for edge upstream: http://[user:pass@]host:port
-function _parseEdgeProxy(url) {
-  if (!url) return null;
-  const s = String(url).replace(/^https?:\/\//, "");
-  const atIdx = s.lastIndexOf("@");
-  const auth = atIdx >= 0 ? s.slice(0, atIdx) : "";
-  const hp = atIdx >= 0 ? s.slice(atIdx + 1) : s;
-  const ci = hp.lastIndexOf(":");
-  const host = ci >= 0 ? hp.slice(0, ci) : hp;
-  const port = ci >= 0 ? parseInt(hp.slice(ci + 1), 10) : 80;
-  const uc = auth.indexOf(":");
-  const user = uc >= 0 ? auth.slice(0, uc) : auth;
-  const pass = uc >= 0 ? auth.slice(uc + 1) : "";
-  return { host, port, user, pass, auth: user ? Buffer.from(`${user}:${pass}`).toString("base64") : "" };
-}
-
-// Connect to target through an upstream HTTP proxy (CONNECT tunnel), then TLS
-function _edgeConnectViaProxy(targetHost, targetPort, proxy, callback) {
-  const sock = net.connect(proxy.port, proxy.host);
-  sock.setNoDelay(true);
-  sock.once("connect", () => {
-    let head = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n`;
-    if (proxy.auth) head += `Proxy-Authorization: Basic ${proxy.auth}\r\n`;
-    head += "\r\n";
-    sock.write(head);
-    let respBuf = Buffer.alloc(0);
-    const onData = (d) => {
-      respBuf = Buffer.concat([respBuf, d]);
-      const end = respBuf.indexOf("\r\n\r\n");
-      if (end < 0) return; // wait for complete header
-      sock.removeListener("data", onData);
-      const status = respBuf.toString("utf8", 0, end).split("\r\n")[0];
-      if (!status.includes("200")) {
-        _splitLog("edge", `proxy rejected CONNECT: ${status}`);
-        try { sock.destroy(); } catch {}
-        return;
-      }
-      _splitLog("edge", `proxy CONNECT OK: ${status}`);
-      const leftover = respBuf.slice(end + 4);
-      const tlsSock = tls.connect({
-        socket: sock,
-        servername: targetHost,
-        rejectUnauthorized: false,
-        ALPNProtocols: ["http/1.1"],
-      }, () => {
-        _splitLog("edge", `TLS established to ${targetHost}`);
-        if (leftover.length > 0) tlsSock.unshift(leftover);
-        callback(tlsSock);
-      });
-      tlsSock.once("error", (e) => { _splitLog("edge", `TLS error: ${e.message}`); });
-    };
-    sock.on("data", onData);
-  });
-  sock.once("error", (e) => { _splitLog("edge", `proxy socket error: ${e.message}`); });
-  sock.once("connect", () => {
-    _splitLog("edge", `proxy socket connected to ${proxy.host}:${proxy.port}`);
-  });
-  return sock;
-}
-
-function handleSplitEdgeConnection(socket, proxyUrl) {
-  socket.setNoDelay(true);
-  socket.setKeepAlive(true, 30000);
-  let buf = Buffer.alloc(0);
-  let targetSocket = null;
-  let connecting = false;
-  const reqId = crypto.randomBytes(3).toString("hex");
-  let target = null;
-  const t0 = Date.now();
-  const logE = (msg) => _splitLog("edge", `[${reqId}] ${msg}`);
-
-  socket.on("data", (chunk) => {
-    if (targetSocket) {
-      targetSocket.write(chunk);
-      return;
-    }
-    if (connecting) {
-      // Buffer data arriving while TLS / proxy connection is being set up
-      buf = Buffer.concat([buf, chunk]);
-      return;
-    }
-    buf = Buffer.concat([buf, chunk]);
-    const metaEnd = buf.indexOf("\r\n\r\n");
-    if (metaEnd === -1) return;
-    const metaStr = buf.toString("utf8", 0, metaEnd);
-    const m = metaStr.match(/^X-Target:\s*(.+):(\d+)\s*$/im);
-    if (!m) {
-      logE(`bad metadata: ${metaStr.slice(0, 50)}`);
-      try { socket.write("HTTP/1.1 400 Bad Request\r\n\r\n"); socket.end(); } catch {}
-      return;
-    }
-    const host = m[1].trim();
-    const port = parseInt(m[2], 10);
-    target = `${host}:${port}`;
-    const remaining = buf.slice(metaEnd + 4);
-    buf = Buffer.alloc(0);
-    connecting = true;
-    logE(`→ ${target}${proxyUrl ? " via proxy" : " direct"}`);
-
-    const proxy = _parseEdgeProxy(proxyUrl);
-    if (proxy) {
-      const proxySock = _edgeConnectViaProxy(host, port, proxy, (tlsSock) => {
-        tlsSock.setNoDelay(true);
-        tlsSock.setKeepAlive(true, 30000);
-        targetSocket = tlsSock;
-        connecting = false;
-        logE(`${target} connected (${Date.now()-t0}ms)`);
-        if (remaining.length > 0) tlsSock.write(remaining);
-        if (buf.length > 0) { tlsSock.write(buf); buf = Buffer.alloc(0); }
-        socket.pipe(tlsSock);
-        tlsSock.pipe(socket);
-        tlsSock.on("end", () => { logE(`${target} upstream ended`); try { socket.end(); } catch {} });
-        tlsSock.on("error", (e) => { logE(`${target} TLS pipe: ${e.message}`); });
-      });
-      proxySock.once("error", (e) => {
-        logE(`${target} proxy fail: ${e.message}`);
-        try { socket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"); socket.end(); } catch {}
-      });
-      return;
-    }
-
-    // Direct TLS connection (no proxy)
-    const tlsSock = tls.connect({ host, port, servername: host, rejectUnauthorized: false, ALPNProtocols: ["http/1.1"] }, () => {
-      tlsSock.setNoDelay(true);
-      tlsSock.setKeepAlive(true, 30000);
-      targetSocket = tlsSock;
-      connecting = false;
-      logE(`${target} connected (${Date.now()-t0}ms)`);
-      if (remaining.length > 0) tlsSock.write(remaining);
-      if (buf.length > 0) { tlsSock.write(buf); buf = Buffer.alloc(0); }
-      socket.pipe(tlsSock);
-      tlsSock.pipe(socket);
-      tlsSock.on("end", () => { logE(`${target} upstream ended`); try { socket.end(); } catch {} });
-      tlsSock.on("error", (e) => { logE(`${target} TLS pipe: ${e.message}`); });
-    });
-    tlsSock.once("error", (e) => {
-      logE(`${target} connect fail: ${e.message}`);
-      try { socket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"); socket.end(); } catch {}
-    });
-  });
-
-  socket.on("error", (e) => {
-    logE(`${target || "?"} client error: ${e.message}`);
-    try { targetSocket?.destroy(); } catch {}
-  });
-  socket.on("end", () => {
-    logE(`${target || "?"} client closed (${Date.now()-t0}ms)`);
-    try { targetSocket?.end(); } catch {}
-  });
-}
-
-function startSplitEdge(opts) {
-  const { host, port } = parseListenAddr(opts.listen || "127.0.0.1:19090");
-  const proxyUrl = opts.proxyUrl || "";
-  const server = net.createServer((socket) => handleSplitEdgeConnection(socket, proxyUrl));
-  server.on("error", (e) => die(`split edge failed: ${e.message}`));
-  server.listen(port, host, () => {
-    info(`split edge listening on ${host}:${port}${proxyUrl ? ` (upstream: ${proxyUrl})` : ""}`);
-    info("no token auth — use SSH tunnel or firewall for security");
-  });
-  return server;
-}
-
-// ── split proxy: local server (client side) ────────────────────────────────
-
-function handleSplitLocalConnection(clientSocket, edgeHost, edgePort) {
-  clientSocket.setNoDelay(true);
-  const rid = crypto.randomBytes(3).toString("hex");
-  const t0 = Date.now();
-  const logL = (msg) => _splitLog("local", `[${rid}] ${msg}`);
-  clientSocket.once("data", (head) => {
-    const headStr = head.toString();
-    const target = connectTargetFromHead(headStr);
-    if (!target) {
-      logL(`bad request: ${headStr.slice(0, 50)}`);
-      try { clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n"); clientSocket.end(); } catch {}
-      return;
-    }
-    logL(`→ ${target.host}:${target.port}`);
-    try {
-      const ctx = getSplitSecureContext(target.host);
-      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-      const tlsSocket = new tls.TLSSocket(clientSocket, {
-        isServer: true,
-        secureContext: ctx,
-        ALPNProtocols: ["http/1.1"],
-      });
-      let pending = [];
-      tlsSocket.on("data", (d) => { pending.push(d); });
-      tlsSocket.once("error", () => { logL(`tls error`); try { edgeSocket?.destroy(); } catch {} });
-
-      const meta = `X-Target: ${target.host}:${target.port}\r\n\r\n`;
-      let closed = false;
-      const cleanup = () => {
-        if (closed) return; closed = true;
-        logL(`${target.host}:${target.port} closed (${Date.now()-t0}ms)`);
-        try { tlsSocket.destroy(); } catch {}
-        try { edgeSocket.destroy(); } catch {}
-        try { clientSocket.destroy(); } catch {}
-      };
-
-      const edgeSocket = net.connect(edgePort, edgeHost, () => {
-        edgeSocket.setNoDelay(true);
-        edgeSocket.setKeepAlive(true, 30000);
-        edgeSocket.write(meta);
-        for (const p of pending) edgeSocket.write(p);
-        pending = null;
-        tlsSocket.removeAllListeners("data");
-        tlsSocket.pipe(edgeSocket);
-        edgeSocket.pipe(tlsSocket);
-        logL(`${target.host}:${target.port} connected (${Date.now()-t0}ms)`);
-      });
-      edgeSocket.on("error", (e) => { logL(`edge: ${e.message}`); cleanup(); });
-      tlsSocket.on("error", (e) => { logL(`tls pipe: ${e.message}`); cleanup(); });
-      clientSocket.on("error", (e) => { logL(`client: ${e.message}`); cleanup(); });
-      clientSocket.on("end", () => { logL(`client ended (${Date.now()-t0}ms)`); cleanup(); });
-    } catch (e) {
-      logL(`setup error: ${e.message}`);
-      try { clientSocket.write("HTTP/1.1 500 Internal Server Error\r\n\r\n"); clientSocket.end(); } catch {}
-    }
-  });
-  clientSocket.on("error", (e) => { _splitLog("local", `[${rid}] early client error: ${e.message}`); });
-}
-
-function startSplitLocal(opts) {
-  const { host, port } = parseListenAddr(opts.listen || "127.0.0.1:18443");
-  // Ensure CA certs exist before accepting connections
-  const ca = ensureSplitCACert();
-  info(`split local CA: ${ca.certPath}`);
-  info(`install CA cert on this machine: NODE_EXTRA_CA_CERTS=${ca.certPath}`);
-  const server = net.createServer((socket) => handleSplitLocalConnection(socket, opts.edgeHost, opts.edgePort));
-  server.on("error", (e) => die(`split local failed: ${e.message}`));
-  server.listen(port, host, () => {
-    info(`split local listening on ${host}:${port}`);
-    info(`edge: ${opts.edgeHost}:${opts.edgePort}`);
-  });
-  return server;
-}
-
-// ── self-update ────────────────────────────────────────────────────────────
-
-async function _checkUpdate(scriptPath, restart = false) {
-  // Throttle: only check once per hour
-  const lastCheckFile = path.join(CONFIG_DIR, ".last_update_check");
-  try {
-    const lastCheck = parseInt(fs.readFileSync(lastCheckFile, "utf8"), 10);
-    if (Date.now() - lastCheck < 3600000) return;
-  } catch {}
-  try { fs.writeFileSync(lastCheckFile, String(Date.now())); } catch {}
-
-  // Fetch remote script
-  let remoteScript = "";
-  let remoteVersion = "";
-  try {
-    const resp = await fetch(UPDATE_URL, { signal: AbortSignal.timeout(15000) });
-    if (!resp.ok) return;
-    remoteScript = await resp.text();
-    const m = remoteScript.match(/const VERSION\s*=\s*"([^"]+)"/);
-    if (!m) return;
-    remoteVersion = m[1];
-  } catch {
-    return;
-  }
-
-  // Compute hashes
-  const localHash = crypto.createHash("sha256").update(fs.readFileSync(scriptPath, "utf8")).digest("hex");
-  const remoteHash = crypto.createHash("sha256").update(remoteScript).digest("hex");
-
-  if (remoteVersion === VERSION && localHash === remoteHash) return;
-
-  const reason = remoteVersion !== VERSION
-    ? `version ${VERSION} → ${remoteVersion}`
-    : `same version ${VERSION} but code changed (${localHash.slice(0,8)} → ${remoteHash.slice(0,8)})`;
-
-  info(`update available (${reason}) — updating...`);
-  _splitLog("edge", `update available (${reason}) — updating...`);
-  try {
-    fs.writeFileSync(scriptPath, remoteScript, { mode: 0o755 });
-    _splitLog("edge", `updated (${remoteHash.slice(0, 8)})`);
-    info(`updated to ${remoteVersion} (${remoteHash.slice(0, 8)})`);
-    if (restart) {
-      _splitLog("edge", "restarting...");
-      const child = spawn(process.execPath, [scriptPath, "--_split-edge-daemon"], { detached: true, stdio: "ignore" });
-      child.unref();
-      process.exit(0);
-    }
-  } catch (e) {
-    _splitLog("edge", `update failed: ${e.message}`);
-    info(`update failed: ${e.message}`);
-  }
-}
-
-// ── split proxy: daemon management ─────────────────────────────────────────
-
-function isSplitEdgeRunning() {
-  try { process.kill(parseInt(fs.readFileSync(SPLIT_EDGE_PID_FILE, "utf8").trim(), 10), 0); return true; } catch { return false; }
-}
-function isSplitLocalRunning() {
-  try { process.kill(parseInt(fs.readFileSync(SPLIT_LOCAL_PID_FILE, "utf8").trim(), 10), 0); return true; } catch { return false; }
-}
-
-function runSplitEdgeDaemon() {
-  process.title = "codex-relay-split-edge";
-  const cfg = loadConfig();
-  const listen = cfg.split?.edge_listen || "127.0.0.1:19090";
-  const proxyUrl = cfg.split?.edge_proxy || "";
-  _splitLog("edge", `daemon starting on ${listen}${proxyUrl ? `, upstream: ${proxyUrl}` : ""}`);
-
-  // Log exit reason for crash diagnosis
-  let _exitReason = "unknown";
-  process.on("exit", (code) => { _splitLog("edge", `exit code=${code} reason=${_exitReason}`); });
-  process.on("SIGHUP", () => { _exitReason = "SIGHUP"; process.exit(0); });
-
-  // Check for updates in background (restarts daemon if updated)
-  _checkUpdate(SCRIPT_PATH, true);
-  process.on("uncaughtException", (e) => {
-    if (e.message?.includes("EPIPE")) {
-      _splitLog("edge", `pipe broken`);
-      return;
-    }
-    _splitLog("edge", `CRASH: ${e.message} — restarting...`);
-    try { fs.unlinkSync(SPLIT_EDGE_PID_FILE); } catch {}
-    try { server.close(); } catch {}
-    // Respawn edge daemon after crash
-    const child = spawn(process.execPath, [SCRIPT_PATH, "--_split-edge-daemon"], { detached: true, stdio: "ignore" });
-    child.unref();
-    process.exit(1);
-  });
-  const hbInterval = setInterval(() => { try { fs.writeFileSync(SPLIT_EDGE_HB_FILE, String(Date.now())); } catch {} }, 60000);
-  // Kill any zombie edge daemon holding our port
-  try {
-    const { port } = parseListenAddr(listen);
-    execSync(`fuser -k ${port}/tcp 2>/dev/null || true`, { encoding: "utf8", timeout: 3000 });
-  } catch {}
-  const server = startSplitEdge({ listen, proxyUrl });
-  fs.writeFileSync(SPLIT_EDGE_PID_FILE, String(process.pid));
-  try { process.stdin.destroy(); } catch {}
-  try { process.stdout.destroy(); } catch {}
-  try { process.stderr.destroy(); } catch {}
-  try { fs.closeSync(0); } catch {}
-  try { fs.closeSync(1); } catch {}
-  try { fs.closeSync(2); } catch {}
-  const cleanup = () => {
-    _exitReason = "signal";
-    _splitLog("edge", "daemon shutting down");
-    clearInterval(hbInterval);
-    try { server.close(); } catch {}
-    try { fs.unlinkSync(SPLIT_EDGE_PID_FILE); } catch {}
-    try { fs.unlinkSync(SPLIT_EDGE_HB_FILE); } catch {}
-    process.exit(0);
-  };
-  process.on("SIGTERM", cleanup);
-  process.on("SIGINT", cleanup);
-}
-
-function runSplitLocalDaemon() {
-  process.title = "codex-relay-split-local";
-  const cfg = loadConfig();
-  const edgePort = parseListenAddr(cfg.split?.edge_listen || "127.0.0.1:19090").port;
-  const listen = cfg.split?.local_listen || "127.0.0.1:18443";
-  _splitLog("local", `daemon starting on ${listen}, edge port ${edgePort}`);
-
-  // Log exit reason for crash diagnosis
-  let _exitReason = "unknown";
-  process.on("exit", (code) => { _splitLog("local", `exit code=${code} reason=${_exitReason}`); });
-  process.on("SIGHUP", () => { _exitReason = "SIGHUP"; process.exit(0); });
-
-  process.on("uncaughtException", (e) => {
-    // EPIPE is recoverable — tunnel died, watchdog will reconnect
-    if (e.message?.includes("EPIPE")) {
-      _splitLog("local", `pipe broken (tunnel down), waiting for watchdog`);
-      return;
-    }
-    _splitLog("local", `CRASH: ${e.message}`);
-    try { fs.unlinkSync(SPLIT_LOCAL_PID_FILE); } catch {}
-    process.exit(1);
-  });
-  const hbInterval = setInterval(() => { try { fs.writeFileSync(SPLIT_LOCAL_HB_FILE, String(Date.now())); } catch {} }, 60000);
-  // Kill any zombie local daemon holding our port
-  try {
-    const { port: lp } = parseListenAddr(listen);
-    execSync(`fuser -k ${lp}/tcp 2>/dev/null || true`, { encoding: "utf8", timeout: 3000 });
-  } catch {}
-  const server = startSplitLocal({ listen, edgeHost: "127.0.0.1", edgePort });
-
-  // Tunnel watchdog: check tunnel + cache edge status every 30s
-  const tunnelWatchdog = setInterval(() => {
-    const cfg2 = loadConfig();
-    if (!cfg2.split?.ssh) return;
-
-    if (!_tunnelPidAlive()) {
-      try {
-        _splitLog("local", "SSH tunnel died — re-establishing...");
-        try { fs.unlinkSync(SPLIT_TUNNEL_PID_FILE); } catch {}
-        const ep = parseListenAddr(cfg2.split.edge_listen || "127.0.0.1:19090").port;
-        _ensureSshTunnel(cfg2.split.ssh, ep, cfg2.split.ssh_key);
-      } catch (e) {
-        _splitLog("local", `tunnel reconnect failed (will retry): ${e.message}`);
-      }
-    }
-
-    // Cache remote edge status + errors for monitor
-    if (_tunnelPidAlive()) {
-      try {
-        const keyArg = cfg2.split.ssh_key ? ["-i", cfg2.split.ssh_key] : [];
-        const out = execSync(`ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${cfg2.split.ssh}' "codex-relay-split status 2>&1 || true"`, { encoding: "utf8", timeout: 8000, stdio: "pipe" });
-        const running = out.includes("split edge:  running");
-        const pm = out.match(/pid (\d+)/);
-        const hm = out.match(/heartbeat:\s+(\S+)/);
-        // Fetch recent edge errors
-        let errors = [];
-        try {
-          const errOut = execSync(`ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${cfg2.split.ssh}' "tail -30 ~/.codex-relay/logs/split-edge.log 2>/dev/null | grep -i -E \\"error|fail|crash|rejected|timed.out\\" | tail -5 || true"`, { encoding: "utf8", timeout: 5000, stdio: "pipe" });
-          errors = errOut.trim().split("\n").filter(Boolean).map(l => l.slice(0, 150));
-        } catch {}
-        const status = {
-          at: Date.now(),
-          running,
-          pid: pm ? pm[1] : "",
-          hb: hm ? hm[1] : "N/A",
-          errors,
-        };
-        try { fs.mkdirSync(CONFIG_DIR, { recursive: true }); } catch {}
-        fs.writeFileSync(EDGE_STATUS_FILE, JSON.stringify(status));
-      } catch {}
-    }
-  }, 30000);
-
-  fs.writeFileSync(SPLIT_LOCAL_PID_FILE, String(process.pid));
-  try { process.stdin.destroy(); } catch {}
-  try { process.stdout.destroy(); } catch {}
-  try { process.stderr.destroy(); } catch {}
-  try { fs.closeSync(0); } catch {}
-  try { fs.closeSync(1); } catch {}
-  try { fs.closeSync(2); } catch {}
-  const cleanup = () => {
-    _exitReason = "signal";
-    _splitLog("local", "daemon shutting down");
-    clearInterval(tunnelWatchdog);
-    clearInterval(hbInterval);
-    try { server.close(); } catch {}
-    try { fs.unlinkSync(SPLIT_LOCAL_PID_FILE); } catch {}
-    try { fs.unlinkSync(SPLIT_LOCAL_HB_FILE); } catch {}
-    _cleanupSplitTunnel();
-    process.exit(0);
-  };
-  process.on("SIGTERM", cleanup);
-  process.on("SIGINT", cleanup);
-}
-
-// ── CLI handlers ───────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// CLI: proxy
+// ═══════════════════════════════════════════════════════════════════════════
 
 function cmdProxySet(url) {
   if (!url) die(`usage: ${NAME} proxy set <url>`);
@@ -721,16 +114,14 @@ function cmdProxySet(url) {
 
 function cmdProxyShow() {
   const cfg = loadConfig();
-
   if (process.env.HTTP_PROXY) console.log(`env proxy:       ${process.env.HTTP_PROXY}`);
   else if (process.env.http_proxy) console.log(`env proxy:       ${process.env.http_proxy}`);
   if (cfg.http) console.log(`config proxy:    ${cfg.http}`);
   if (cfg.http || process.env.HTTP_PROXY || process.env.http_proxy) {
     console.log(`effective proxy: ${cfg.http || process.env.HTTP_PROXY || process.env.http_proxy}`);
   } else {
-    console.log(`effective proxy: none`);
+    console.log("effective proxy: none");
   }
-
 }
 
 function cmdProxyUnset() {
@@ -741,493 +132,6 @@ function cmdProxyUnset() {
   info("proxy configuration cleared.");
 }
 
-function _splitDaemonStart(kind, spawnArgs) {
-  const checkFn = kind === "edge" ? isSplitEdgeRunning : isSplitLocalRunning;
-  const pidFile = kind === "edge" ? SPLIT_EDGE_PID_FILE : SPLIT_LOCAL_PID_FILE;
-  if (checkFn()) {
-    info(`split ${kind} already running (pid ${fs.readFileSync(pidFile, "utf8").trim()})`);
-    return;
-  }
-  const child = spawn(process.execPath, spawnArgs, { detached: true, stdio: ["ignore", "ignore", "pipe"] });
-  let errBuf = "";
-  child.stderr.on("data", (c) => { errBuf += c.toString(); });
-  child.unref();
-  for (let i = 0; i < 20; i++) {
-    if (checkFn()) break;
-    execSync("sleep 0.1", { stdio: "ignore" });
-  }
-  if (!checkFn()) die(`failed to start split ${kind} daemon${errBuf ? ":\n" + errBuf.trim() : ""}`);
-  info(`split ${kind} started (pid ${fs.readFileSync(pidFile, "utf8").trim()})`);
-}
-
-function _cleanupSplitTunnel() {
-  try {
-    const pid = parseInt(fs.readFileSync(SPLIT_TUNNEL_PID_FILE, "utf8").trim(), 10);
-    if (pid) { process.kill(pid, "SIGTERM"); }
-  } catch {}
-  try { fs.unlinkSync(SPLIT_TUNNEL_PID_FILE); } catch {}
-}
-
-function _splitDaemonStop(kind) {
-  const pidFile = kind === "edge" ? SPLIT_EDGE_PID_FILE : SPLIT_LOCAL_PID_FILE;
-  const hbFile = kind === "edge" ? SPLIT_EDGE_HB_FILE : SPLIT_LOCAL_HB_FILE;
-  const checkFn = kind === "edge" ? isSplitEdgeRunning : isSplitLocalRunning;
-  if (!checkFn()) { info(`split ${kind} not running.`); return; }
-  const pid = parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
-  try { process.kill(pid, "SIGTERM"); } catch {}
-  try { fs.unlinkSync(pidFile); } catch {}
-  try { fs.unlinkSync(hbFile); } catch {}
-  if (kind === "local") _cleanupSplitTunnel();
-  info(`split ${kind} stopped.`);
-}
-
-function _splitDaemonStatus(kind) {
-  const pidFile = kind === "edge" ? SPLIT_EDGE_PID_FILE : SPLIT_LOCAL_PID_FILE;
-  const hbFile = kind === "edge" ? SPLIT_EDGE_HB_FILE : SPLIT_LOCAL_HB_FILE;
-  const checkFn = kind === "edge" ? isSplitEdgeRunning : isSplitLocalRunning;
-  if (!checkFn()) { console.log(`split ${kind}:  stopped`); return; }
-  const pid = fs.readFileSync(pidFile, "utf8").trim();
-  const hbAge = (() => {
-    try { return `${Math.round((Date.now() - parseInt(fs.readFileSync(hbFile, "utf8"), 10)) / 1000)}s ago`; }
-    catch { return "N/A"; }
-  })();
-  console.log(`split ${kind}:  running (pid ${pid})`);
-  console.log(`  heartbeat:   ${hbAge}`);
-}
-
-function _tunnelPidAlive() {
-  try {
-    const pid = parseInt(fs.readFileSync(SPLIT_TUNNEL_PID_FILE, "utf8").trim(), 10);
-    if (!pid) return false;
-    process.kill(pid, 0);
-    return true;
-  } catch { return false; }
-}
-
-// Parse SSH connection string: user@host
-function _parseSsh(s) {
-  const atIdx = s.indexOf("@");
-  if (atIdx < 0) return { user: "root", host: s };
-  return { user: s.slice(0, atIdx), host: s.slice(atIdx + 1) };
-}
-
-function _ensureSshTunnel(sshTarget, edgePort, sshKey) {
-  if (_tunnelPidAlive()) return;
-  _splitLog("local", `establishing SSH tunnel 127.0.0.1:${edgePort} → ${sshTarget}:${edgePort}`);
-  try { fs.unlinkSync(SPLIT_TUNNEL_PID_FILE); } catch {}
-
-  const { user, host } = _parseSsh(sshTarget);
-  const keyArg = sshKey ? ["-i", sshKey] : [];
-  const sshArgs = [
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "ExitOnForwardFailure=yes",
-    "-o", "ServerAliveInterval=30",
-    "-o", "ServerAliveCountMax=3",
-    "-o", "TCPKeepAlive=yes",
-    "-N", "-f",
-    "-L", `${edgePort}:127.0.0.1:${edgePort}`,
-    ...keyArg,
-    `${user}@${host}`,
-  ];
-
-  function trySsh() {
-    execSync(`ssh ${sshArgs.map((a) => `'${a}'`).join(" ")} 2>&1`, { encoding: "utf8", timeout: 15000, stdio: "pipe" });
-  }
-
-  info(`establishing SSH tunnel: 127.0.0.1:${edgePort} → ${host}:${edgePort}`);
-  try {
-    trySsh();
-  } catch (e) {
-    const msg = (e.stderr || e.stdout || e.message || "").toString();
-    if (msg.includes("ddress already in use") || msg.includes("bind")) {
-      info(`port ${edgePort} in use — freeing and retrying...`);
-      try { execSync(`fuser -k ${edgePort}/tcp 2>/dev/null`, { encoding: "utf8", timeout: 3000 }); } catch {}
-      execSync("sleep 0.5", { stdio: "ignore" });
-      try {
-        trySsh();
-      } catch (e2) {
-        const msg2 = (e2.stderr || e2.stdout || e2.message || "").toString();
-        if (msg2.includes("ddress already in use") || msg2.includes("bind")) {
-          let who = "";
-          try { who = execSync(`fuser -v ${edgePort}/tcp 2>&1`, { encoding: "utf8", timeout: 2000 }).trim(); } catch {}
-          if (!who) {
-            try { who = execSync(`ss -tlnp 'sport = :${edgePort}' 2>&1`, { encoding: "utf8", timeout: 2000 }).trim(); } catch {}
-          }
-          throw new Error(`port ${edgePort} is in use by another process:\n${who || "  (try: sudo fuser -v " + edgePort + "/tcp)"}\n  Free it (sudo fuser -k ${edgePort}/tcp) or use a different port.`);
-        }
-        throw new Error(`ssh tunnel failed: ${msg2.trim()}`);
-      }
-    } else {
-      throw new Error(`ssh tunnel failed: ${msg.trim()}`);
-    }
-  }
-
-  for (let i = 0; i < 20; i++) {
-    execSync("sleep 0.15", { stdio: "ignore" });
-    try {
-      const out = execSync(`fuser ${edgePort}/tcp 2>/dev/null`, { encoding: "utf8", timeout: 2000 }).trim();
-      const pid = out.split(/\s+/).filter(Boolean).pop();
-      if (pid) {
-        fs.writeFileSync(SPLIT_TUNNEL_PID_FILE, pid);
-        info(`SSH tunnel up (pid ${pid})`);
-        _splitLog("local", `SSH tunnel established (pid ${pid})`);
-        return;
-      }
-    } catch {}
-  }
-  _splitLog("local", `tunnel not reachable on port ${edgePort} after 3s`);
-  throw new Error(`SSH tunnel not reachable on port ${edgePort} after 3s`);
-}
-
-function _ensureRemoteEdge(sshTarget, sshKey) {
-  if (!shutil("ssh")) { info("ssh not found — skip remote edge start"); return; }
-
-  const keyArg = sshKey ? ["-i", sshKey] : [];
-  const { user, host } = _parseSsh(sshTarget);
-  const dest = `${user}@${host}`;
-
-  // Quick check: is edge already running on remote?
-  try {
-    const out = execSync(`ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${dest}' "codex-relay split status 2>&1 || true"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" });
-    if (out.includes("split edge:  running")) {
-      info(`remote edge already running on ${host}`);
-      return;
-    }
-  } catch {}
-
-  // Start edge on remote (auto-detects edge mode: no SSH config → edge)
-  info(`starting remote edge on ${host}...`);
-  try {
-    const out = execSync(`ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${dest}' "codex-relay split start 2>&1"`, { encoding: "utf8", timeout: 15000, stdio: "pipe" });
-    info(out.trim());
-  } catch (e) {
-    const msg = (e.stderr || e.stdout || e.message || "").toString().trim();
-    info(`remote edge start: ${msg || "failed — run manually on ${host}: codex-relay split start"}`);
-  }
-}
-
-function cmdSplitLogs() {
-  let found = false;
-  for (const kind of ["local", "edge"]) {
-    const file = kind === "edge" ? SPLIT_EDGE_LOG_FILE : SPLIT_LOCAL_LOG_FILE;
-    try {
-      const content = fs.readFileSync(file, "utf8");
-      if (!content.trim()) continue;
-      console.log(`── split ${kind} ──`);
-      process.stdout.write(content);
-      if (!content.endsWith("\n")) console.log("");
-      found = true;
-    } catch {}
-  }
-  if (!found) console.log("(no logs)");
-}
-
-function cmdSplit(args) {
-  const action = args[0];
-  const opts = parseArgs(args.slice(1));
-
-  // Resolve SSH target: first positional arg containing @
-  const sshTarget = opts._.find(a => a.includes("@")) || "";
-
-  switch (action) {
-    case "start": {
-      // Background update check (fire-and-forget, throttled to 1/hr)
-      _checkUpdate(SCRIPT_PATH, false);
-
-      if (sshTarget) {
-        // Local mode: start local proxy with SSH tunnel + remote edge
-        const cfg = loadConfig();
-        cfg.split = cfg.split || {};
-        cfg.split.ssh = sshTarget;
-        if (opts["ssh-key"]) cfg.split.ssh_key = opts["ssh-key"];
-        if (opts.listen) cfg.split.local_listen = opts.listen;
-        // Auto-set proxy to local split proxy so codex-relay run just works
-        const localListen = cfg.split.local_listen || "127.0.0.1:18443";
-        cfg.http = `http://${localListen}`;
-        cfg.https = `http://${localListen}`;
-        saveConfig(cfg);
-        const edgePort = parseListenAddr(cfg.split.edge_listen || "127.0.0.1:19090").port;
-        try { _ensureSshTunnel(sshTarget, edgePort, opts["ssh-key"]); }
-        catch (e) { die(e.message); }
-        _splitDaemonStart("local", [SCRIPT_PATH, "--_split-local-daemon"]);
-        _ensureRemoteEdge(sshTarget, opts["ssh-key"]);
-        return;
-      }
-
-      // Auto-detect from saved config
-      const cfg = loadConfig();
-      if (cfg.split?.ssh) {
-        // Saved SSH → local mode
-        const localListen = cfg.split.local_listen || "127.0.0.1:18443";
-        cfg.http = `http://${localListen}`;
-        cfg.https = `http://${localListen}`;
-        saveConfig(cfg);
-        const edgePort = parseListenAddr(cfg.split.edge_listen || "127.0.0.1:19090").port;
-        try { _ensureSshTunnel(cfg.split.ssh, edgePort, cfg.split.ssh_key); }
-        catch (e) { die(e.message); }
-        _splitDaemonStart("local", [SCRIPT_PATH, "--_split-local-daemon"]);
-        _ensureRemoteEdge(cfg.split.ssh, cfg.split.ssh_key);
-        return;
-      }
-
-      // No SSH config → edge mode (this machine is the VPS)
-      const listen = opts.listen || cfg.split?.edge_listen || "127.0.0.1:19090";
-      cfg.split = cfg.split || {};
-      cfg.split.edge_listen = listen;
-      saveConfig(cfg);
-      _splitDaemonStart("edge", [SCRIPT_PATH, "--_split-edge-daemon"]);
-      return;
-    }
-
-    case "stop":
-      _splitDaemonStop("local");
-      _splitDaemonStop("edge");
-      // Also stop remote edge via SSH
-      try {
-        const cfg = loadConfig();
-        if (cfg.split?.ssh) {
-          const keyArg = cfg.split.ssh_key ? ["-i", cfg.split.ssh_key] : [];
-          const { user, host } = _parseSsh(cfg.split.ssh);
-          try {
-            execSync(`ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${user}@${host}' "codex-relay split stop 2>&1 || true"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" });
-          } catch {}
-        }
-      } catch {}
-      break;
-
-    case "status":
-      _splitDaemonStatus("local");
-      console.log(""); // blank line between local and edge
-      _splitDaemonStatus("edge");
-      // Show SSH tunnel status if present
-      if (_tunnelPidAlive()) {
-        try {
-          const pid = fs.readFileSync(SPLIT_TUNNEL_PID_FILE, "utf8").trim();
-          console.log(`ssh tunnel:   running (pid ${pid})`);
-        } catch {}
-      }
-      break;
-
-    case "logs":
-      cmdSplitLogs();
-      break;
-
-    case "proxy": {
-      const sub = opts._[0];
-      if (sub === "set") {
-        const url = opts._[1];
-        if (!url) die(`usage: ${NAME} split proxy set <url>`);
-        const cfg = loadConfig();
-        cfg.split = cfg.split || {};
-        cfg.split.edge_proxy = url;
-        saveConfig(cfg);
-        info(`split edge proxy set to: ${url}`);
-      } else if (!sub || sub === "show") {
-        const cfg = loadConfig();
-        if (cfg.split?.edge_proxy) {
-          console.log(cfg.split.edge_proxy);
-        } else {
-          console.log("(no edge proxy configured)");
-        }
-      } else if (sub === "unset" || sub === "clear") {
-        const cfg = loadConfig();
-        if (cfg.split) delete cfg.split.edge_proxy;
-        saveConfig(cfg);
-        info("split edge proxy cleared.");
-      } else {
-        die(`usage: ${NAME} split proxy {set|show|unset}`);
-      }
-      break;
-    }
-
-    case "update":
-      info("checking for updates...");
-      _checkUpdate(SCRIPT_PATH, false).then(() => {
-        info("update check complete.");
-      }).catch((e) => {
-        info(`update check failed: ${e.message}`);
-      });
-      break;
-
-    case "version":
-      console.log(`${NAME} ${VERSION}`);
-      break;
-
-    case "monitor":
-      cmdSplitMonitor();
-      break;
-
-    case "check":
-      cmdSplitCheck(opts);
-      break;
-
-    default:
-      die(`usage: ${NAME} split {start|stop|status|logs|proxy|update|version|monitor|check}`);
-  }
-}
-
-const EDGE_STATUS_FILE = path.join(CONFIG_DIR, "edge.status");
-
-function _renderStatus(label, alive, detail) {
-  const icon = alive ? "\x1b[32m●\x1b[0m" : "\x1b[31m●\x1b[0m";
-  const state = alive ? "running" : "stopped";
-  return `${icon} ${label.padEnd(8)} ${state.padEnd(8)}${detail || ""}`;
-}
-
-function _readErrors(logFile, since, maxLines) {
-  try {
-    const lines = fs.readFileSync(logFile, "utf8").split("\n").filter(Boolean);
-    const recent = [];
-    for (let i = lines.length - 1; i >= 0 && recent.length < maxLines; i--) {
-      const line = lines[i];
-      const tsMatch = line.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})/);
-      if (!tsMatch) continue;
-      if (new Date(tsMatch[1]).getTime() < since) break;
-      if (/(error|fail|CRASH|rejected|timed?\s*out)/i.test(line)) {
-        recent.unshift(line.slice(0, 160));
-      }
-    }
-    return recent;
-  } catch { return []; }
-}
-
-function _readCachedEdgeStatus() {
-  try {
-    const data = JSON.parse(fs.readFileSync(EDGE_STATUS_FILE, "utf8"));
-    if (Date.now() - data.at < 120000) return data; // cache valid for 2 min
-  } catch {}
-  return null;
-}
-
-function cmdSplitMonitor() {
-  let running = true;
-  let edgeCache = _readCachedEdgeStatus();
-
-  if (process.stdin.isTTY) {
-    process.stdin.setRawMode(true);
-    process.stdin.on("data", (d) => {
-      if (d.toString() === "q" || d[0] === 3) {
-        running = false;
-        if (process.stdin.isTTY) process.stdin.setRawMode(false);
-        process.stdout.write("\x1b[?25h\x1b[0m\nmonitor stopped.\n");
-        process.exit(0);
-      }
-    });
-    process.stdout.write("\x1b[?25l"); // hide cursor
-  }
-
-  let lineCount = 0;
-  function tick() {
-    if (!running) return;
-
-    // Move cursor to home, don't clear — overwrite in place
-    if (process.stdin.isTTY) process.stdout.write("\x1b[H");
-    else process.stdout.write("\x1b[2J\x1b[H");
-
-    const now = Date.now();
-    const since = now - 300000;
-    let lines = [];
-
-    lines.push(`\x1b[1mcodex-relay ${VERSION} — split monitor\x1b[0m  ${process.stdin.isTTY ? "(q quit, 3s refresh)" : ""}`);
-    lines.push("");
-
-    // Local daemon
-    const localAlive = isSplitLocalRunning();
-    let localDetail = "";
-    if (localAlive) {
-      try {
-        const pid = fs.readFileSync(SPLIT_LOCAL_PID_FILE, "utf8").trim();
-        const hbAge = (() => {
-          try { return `${Math.round((now - parseInt(fs.readFileSync(SPLIT_LOCAL_HB_FILE, "utf8"), 10)) / 1000)}s`; }
-          catch { return "N/A"; }
-        })();
-        localDetail = `pid ${pid}, hb ${hbAge}`;
-      } catch {}
-    }
-    lines.push(_renderStatus("local", localAlive, localDetail));
-
-    // SSH tunnel
-    const tunnelAlive = _tunnelPidAlive();
-    let tunnelDetail = "";
-    if (tunnelAlive) {
-      try { tunnelDetail = `pid ${fs.readFileSync(SPLIT_TUNNEL_PID_FILE, "utf8").trim()}`; } catch {}
-    }
-    lines.push(_renderStatus("tunnel", tunnelAlive, tunnelDetail));
-
-    // Edge — use cached status, fallback to direct SSH check
-    edgeCache = _readCachedEdgeStatus();
-    let edgeAlive = false, edgeDetail = "";
-    if (edgeCache) {
-      edgeAlive = edgeCache.running;
-      edgeDetail = `pid ${edgeCache.pid}, hb ${edgeCache.hb}`;
-      if (edgeCache.errors && edgeCache.errors.length > 0) {
-        lines.push(_renderStatus("edge", edgeAlive, edgeDetail));
-        for (const e of edgeCache.errors) {
-          lines.push(`  \x1b[33m!\x1b[0m [edge] ${e}`);
-        }
-        edgeDetail = ""; // already rendered
-      }
-    } else {
-      const cfg = loadConfig();
-      if (!cfg.split?.ssh) {
-        edgeAlive = isSplitEdgeRunning();
-        if (edgeAlive) {
-          try { edgeDetail = `pid ${fs.readFileSync(SPLIT_EDGE_PID_FILE, "utf8").trim()}`; } catch {}
-        }
-      } else if (tunnelAlive) {
-        // First tick: quick SSH check instead of showing "fetching..."
-        try {
-          const keyArg = cfg.split.ssh_key ? ["-i", cfg.split.ssh_key] : [];
-          const out = execSync(`ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${cfg.split.ssh}' "codex-relay-split status 2>&1 || true"`, { encoding: "utf8", timeout: 5000, stdio: "pipe" });
-          edgeAlive = out.includes("split edge:  running");
-          if (edgeAlive) {
-            const pm = out.match(/pid (\d+)/);
-            const hm = out.match(/heartbeat:\s+(\S+)/);
-            edgeDetail = `${pm ? "pid "+pm[1] : ""}${hm ? ", hb "+hm[1] : ""}`;
-          }
-        } catch { edgeDetail = "SSH unreachable"; }
-      } else {
-        edgeDetail = "tunnel down";
-      }
-    }
-    if (edgeDetail) lines.push(_renderStatus("edge", edgeAlive, edgeDetail));
-
-    lines.push("");
-
-    // Config
-    const cfg = loadConfig();
-    if (cfg.split?.edge_proxy) {
-      lines.push(`proxy:  ${cfg.split.edge_proxy.replace(/\/\/[^@]+@/, "//***@")}`);
-    } else {
-      lines.push("proxy:  (none)");
-    }
-
-    lines.push("");
-
-    // Errors
-    lines.push("\x1b[1m── errors (5m) ──\x1b[0m");
-    const localErrors = _readErrors(SPLIT_LOCAL_LOG_FILE, since, 15);
-    if (localErrors.length === 0) {
-      lines.push("  (none)");
-    } else {
-      for (const e of localErrors) {
-        lines.push(`  \x1b[33m!\x1b[0m ${e}`);
-      }
-    }
-
-    // Pad to prevent old lines from showing
-    while (lines.length < lineCount) lines.push("");
-    lineCount = Math.max(lineCount, lines.length);
-
-    process.stdout.write(lines.join("\n") + "\n");
-
-    if (running && process.stdin.isTTY) setTimeout(tick, 3000);
-  }
-
-  tick();
-  if (process.stdin.isTTY) setInterval(() => {}, 60000);
-}
-
 function cmdProxyCheck(opts = {}) {
   const testUrl = opts.url || "https://api.openai.com";
   const timeout = opts.timeout || 10;
@@ -1236,25 +140,19 @@ function cmdProxyCheck(opts = {}) {
   const ok = [];
 
   const check = (label, condition, detail) => {
-    if (condition) {
-      ok.push(label + (detail ? ` (${detail})` : ""));
-    } else {
-      issues.push(label + (detail ? ` — ${detail}` : ""));
-    }
+    if (condition) ok.push(label + (detail ? ` (${detail})` : ""));
+    else issues.push(label + (detail ? ` — ${detail}` : ""));
   };
 
-  // 1. Proxy config
   const cfg = loadConfig();
   const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy ||
                    process.env.HTTP_PROXY || process.env.http_proxy ||
                    cfg.https || cfg.http;
   check("proxy config", !!proxyUrl, proxyUrl || "not configured — run: proxy set <url>");
 
-  // 2. curl available
   const haveCurl = !!shutil("curl");
   check("curl", haveCurl, haveCurl ? "available" : "not found — required for proxy check");
 
-  // 3. Proxy connectivity
   if (proxyUrl && haveCurl) {
     const start = Date.now();
     try {
@@ -1274,121 +172,13 @@ function cmdProxyCheck(opts = {}) {
     check("proxy connectivity", false, "no proxy configured");
   }
 
-  // 4. npm available
   const haveNpm = !!shutil("npm");
   check("npm", haveNpm, haveNpm ? "available" : "not found — needed for codex install");
 
-  // 5. codex binary
   const codexBin = findCodex();
   check("codex CLI", !!codexBin, codexBin ? codexVersion() : "not installed — run: install");
 
-  // ── Results ──
   console.log("codex-relay proxy check\n");
-  for (const item of ok) {
-    console.log(`  ✓ ${item}`);
-  }
-  if (issues.length > 0) {
-    console.log("");
-    for (const item of issues) {
-      console.log(`  ✗ ${item}`);
-    }
-  }
-  console.log("");
-  console.log(`${ok.length} OK, ${issues.length} issue${issues.length !== 1 ? "s" : ""}`);
-
-  if (issues.length > 0) process.exit(1);
-}
-
-function cmdSplitCheck(opts = {}) {
-  const testUrl = opts.url || "https://api.openai.com";
-  const timeout = opts.timeout || 10;
-  const cfg = loadConfig();
-  const edgeAddr = cfg.split?.edge_listen || "127.0.0.1:19090";
-
-  const issues = [];
-  const ok = [];
-
-  const check = (label, condition, detail) => {
-    if (condition) ok.push(label + (detail ? ` (${detail})` : ""));
-    else issues.push(label + (detail ? ` — ${detail}` : ""));
-  };
-
-  // 1. openssl
-  const haveOpenssl = !!shutil("openssl");
-  check("openssl", haveOpenssl, haveOpenssl ? "available" : "not found — required for local TLS termination");
-
-  // 2. CA cert
-  const caCertPath = path.join(CERT_DIR, "ca-cert.pem");
-  const haveCACert = fs.existsSync(caCertPath);
-  check("CA certificate", haveCACert, haveCACert ? caCertPath : "not found — run: split start (generates on first start)");
-
-  // 3. curl
-  const haveCurl = !!shutil("curl");
-  check("curl", haveCurl, haveCurl ? "available" : "not found — required for connectivity test");
-
-  function canConnect(host, port, timeoutMs = 2000) {
-    return new Promise((resolve) => {
-      const s = net.connect(port, host);
-      const done = (ok) => {
-        try { s.destroy(); } catch {}
-        resolve(ok);
-      };
-      s.setTimeout(timeoutMs);
-      s.once("connect", () => done(true));
-      s.once("timeout", () => done(false));
-      s.once("error", () => done(false));
-    });
-  }
-
-  // 4. Edge proxy reachable
-  if (haveCurl) {
-    const { host: edgeHost, port: edgePort } = parseListenAddr(edgeAddr);
-    const connectHost = edgeHost === "0.0.0.0" ? "127.0.0.1" : edgeHost;
-    const edgeReachable = execSync(
-      `${process.execPath} -e "const net=require('net');const s=net.connect(${edgePort}, '${connectHost.replace(/'/g, "\\'")}');s.setTimeout(2000);s.once('connect',()=>{s.destroy();process.exit(0)});s.once('timeout',()=>process.exit(1));s.once('error',()=>process.exit(1));"`,
-      { stdio: "ignore", timeout: 3000 }
-    ) === undefined;
-    check("edge proxy", edgeReachable, `TCP ${edgeAddr}` + (edgeReachable ? " open" : " unreachable — check SSH tunnel or edge server"));
-
-    // 5. Full split proxy chain
-    if (edgeReachable && haveCACert && haveCurl) {
-      const tempListen = "127.0.0.1:18448";
-      const tempAddr = parseListenAddr(tempListen);
-      const tempServer = startSplitLocal({ listen: tempListen, edgeHost: connectHost, edgePort });
-      // Wait for it to start listening
-      for (let i = 0; i < 20; i++) {
-        execSync("sleep 0.1", { stdio: "ignore" });
-        try {
-          execSync(
-            `${process.execPath} -e "const net=require('net');const s=net.connect(${tempAddr.port}, '${tempAddr.host}');s.setTimeout(500);s.once('connect',()=>{s.destroy();process.exit(0)});s.once('timeout',()=>process.exit(1));s.once('error',()=>process.exit(1));"`,
-            { stdio: "ignore", timeout: 1000 }
-          );
-          break;
-        } catch {}
-      }
-      const start = Date.now();
-      try {
-        const out = execSync(
-          `curl -s -S -o /dev/null -w '%{http_code}' --cacert '${caCertPath}' --proxy 'http://${tempListen}' --connect-timeout ${timeout} --max-time ${timeout} '${testUrl}' 2>&1`,
-          { encoding: "utf8", timeout: (timeout + 5) * 1000 }
-        ).trim();
-        const latency = Date.now() - start;
-        const code = parseInt(out, 10);
-        check("split proxy chain", code >= 200 && code < 500, `HTTP ${out}, ${latency}ms → ${testUrl}`);
-      } catch (e) {
-        const latency = Date.now() - start;
-        const cause = e.stderr ? e.stderr.toString().trim().slice(0, 80) : (e.message || "").slice(0, 80);
-        check("split proxy chain", false, `failed after ${latency}ms: ${cause} → ${testUrl}`);
-      }
-      try { tempServer.close(); } catch {}
-    }
-  } else {
-    check("edge proxy", false, "curl not available");
-    check("split proxy chain", false, "curl not available");
-  }
-
-  // ── Results ──
-  console.log("codex-relay split check\n");
   for (const item of ok) console.log(`  ✓ ${item}`);
   if (issues.length > 0) {
     console.log("");
@@ -1396,18 +186,16 @@ function cmdSplitCheck(opts = {}) {
   }
   console.log("");
   console.log(`${ok.length} OK, ${issues.length} issue${issues.length !== 1 ? "s" : ""}`);
-
   if (issues.length > 0) process.exit(1);
 }
 
-function shutil(name) {
-  try { execSync(`which ${name}`, { encoding: "utf8", stdio: "ignore" }); return true; } catch { return false; }
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// CLI: install
+// ═══════════════════════════════════════════════════════════════════════════
 
 async function cmdInstallSelf(opts = {}) {
   const isRoot = process.getuid && process.getuid() === 0;
 
-  // Candidate install directories: first writable one wins
   const candidates = [
     "/usr/local/bin",
     ...(isRoot ? ["/usr/local/sbin"] : []),
@@ -1427,9 +215,7 @@ async function cmdInstallSelf(opts = {}) {
       fs.unlinkSync(testFile);
       binDir = dir;
       break;
-    } catch {
-      continue;
-    }
+    } catch { continue; }
   }
 
   if (!binDir) {
@@ -1449,7 +235,6 @@ async function cmdInstallSelf(opts = {}) {
     scriptContent = fs.readFileSync(SCRIPT_PATH, "utf8");
   }
 
-  // Check if already installed — prompt unless --force
   if (dest && fs.existsSync(dest) && !opts.force) {
     const readline = require("readline");
     const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
@@ -1459,27 +244,12 @@ async function cmdInstallSelf(opts = {}) {
         res(a.trim().toLowerCase());
       });
     });
-    if (answer !== "y" && answer !== "yes") {
-      info("skipped.");
-      return;
-    }
+    if (answer !== "y" && answer !== "yes") { info("skipped."); return; }
   }
 
-  // Write to bin directory
   try {
     fs.writeFileSync(dest, scriptContent, { mode: 0o755 });
 
-    // Also install codex-relay-split wrapper
-    const splitDest = path.join(binDir, "codex-relay-split");
-    const splitScriptPath = path.join(path.dirname(SCRIPT_PATH), "codex-relay-split");
-    try {
-      if (fs.existsSync(splitScriptPath)) {
-        const splitContent = fs.readFileSync(splitScriptPath, "utf8");
-        fs.writeFileSync(splitDest, splitContent, { mode: 0o755 });
-      }
-    } catch {}
-
-    // Check if the binary is findable right now
     const inPath = process.env.PATH.split(":").some((p) => path.resolve(p) === path.resolve(binDir));
     let findable = false;
     try {
@@ -1498,17 +268,13 @@ async function cmdInstallSelf(opts = {}) {
       info(`installed to ${dest}`);
       info(`  hint: refresh shell cache — run: hash -r`);
     } else {
-      // Not on PATH — provide exact setup instructions
       const exportLine = `export PATH="${binDir}:\\$PATH"`;
-
       info(`installed to ${dest}`);
       info(`  bin directory ${binDir} is not on PATH. To add it:`);
       info(``);
       info(`    echo '${exportLine}' >> ${shellRc}`);
       info(`    source ${shellRc}`);
       info(``);
-
-      // For macOS bash users, also mention sourcing from .bash_profile
       if (shellRc.endsWith(".bashrc") && !fs.existsSync(rc)) {
         const bp = path.join(home, ".bash_profile");
         if (fs.existsSync(bp)) {
@@ -1516,21 +282,11 @@ async function cmdInstallSelf(opts = {}) {
           info(`    echo '[ -f ~/.bashrc ] && source ~/.bashrc' >> ~/.bash_profile`);
         }
       }
-
-      // When running via sudo, remind about the original user
-      if (SUDO_USER) {
-        info(`  note: the PATH change above applies to user ${SUDO_USER}, not root`);
-      }
-
-      if (SUDO_USER) {
-        info(`  After setup, run as ${SUDO_USER}: ${NAME} --help`);
-      } else {
-        info(`  Then: ${NAME} --help`);
-      }
+      if (SUDO_USER) info(`  note: the PATH change above applies to user ${SUDO_USER}, not root`);
+      if (SUDO_USER) info(`  After setup, run as ${SUDO_USER}: ${NAME} --help`);
+      else info(`  Then: ${NAME} --help`);
     }
-  } catch (e) {
-    throw e;
-  }
+  } catch (e) { throw e; }
 }
 
 async function cmdInstallCodex(env, version) {
@@ -1557,7 +313,6 @@ async function cmdUpdateCodex(env) {
 }
 
 async function cmdInstall(opts = {}) {
-  // Apply proxy
   const cfg = loadConfig();
   const proxyUrl = cfg.https || cfg.http;
   const env = { ...process.env };
@@ -1570,39 +325,27 @@ async function cmdInstall(opts = {}) {
     env.no_proxy = "localhost,127.0.0.1,::1,.local";
   }
 
-  // Explicit flags — do exactly what was asked
-  if (opts.update) {
-    await cmdUpdateCodex(env);
-    return;
-  }
-  if (opts.version) {
-    await cmdInstallCodex(env, opts.version);
-    return;
-  }
+  if (opts.update) { await cmdUpdateCodex(env); return; }
+  if (opts.version) { await cmdInstallCodex(env, opts.version); return; }
 
-  // Default: install both codex-relay + codex CLI
   info("step 1/2: installing codex-relay ...");
-  try {
-    await cmdInstallSelf(opts);
-  } catch (e) {
-    if (opts.force) die(e.message);
-    info(`codex-relay self-install skipped (${e.message})`);
-  }
+  try { await cmdInstallSelf(opts); }
+  catch (e) { if (opts.force) die(e.message); info(`codex-relay self-install skipped (${e.message})`); }
 
   info("step 2/2: checking Codex CLI ...");
-  if (findCodex()) {
-    info(`codex already installed (${codexVersion() || "unknown"})`);
-  } else {
-    await cmdInstallCodex(env);
-  }
+  if (findCodex()) info(`codex already installed (${codexVersion() || "unknown"})`);
+  else await cmdInstallCodex(env);
 
   info("install complete.");
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// CLI: run
+// ═══════════════════════════════════════════════════════════════════════════
+
 function cmdRun(args) {
   const codexBin = findCodex() || die("'codex' not found. Install with: codex-relay install");
 
-  // Set up proxy for codex
   const env = { ...process.env };
   const noProxy = "localhost,127.0.0.1,::1,.local";
 
@@ -1622,100 +365,50 @@ function cmdRun(args) {
     info(`using proxy: ${proxyUrl}`);
   }
 
-  // Split proxy mode: auto-start daemon if using local split proxy
-  if (proxyUrl && (proxyUrl.includes("127.0.0.1") || proxyUrl.includes("localhost"))) {
-    if (!isSplitLocalRunning() && cfg.split?.ssh) {
-      info("split proxy not running — auto-starting...");
-      try {
-        const edgePort = parseListenAddr(cfg.split.edge_listen || "127.0.0.1:19090").port;
-        _ensureSshTunnel(cfg.split.ssh, edgePort, cfg.split.ssh_key);
-        _splitDaemonStart("local", [SCRIPT_PATH, "--_split-local-daemon"]);
-        _ensureRemoteEdge(cfg.split.ssh, cfg.split.ssh_key);
-        // Give the daemon a moment to start listening
-        execSync("sleep 0.5", { stdio: "ignore" });
-      } catch (e) {
-        info(`auto-start failed: ${e.message} — continuing anyway`);
-      }
-    }
-  }
-
-  // Inject local CA cert so codex trusts TLS-terminated connections
-  const caCertPath = path.join(CERT_DIR, "ca-cert.pem");
-  if (proxyUrl && (proxyUrl.includes("127.0.0.1") || proxyUrl.includes("localhost")) && fs.existsSync(caCertPath)) {
-    // Build combined bundle: system CAs + local CA (codex is Rust, needs OpenSSL env vars)
-    const combinedPath = path.join(CERT_DIR, "combined-ca.pem");
-    try {
-      let combined = fs.readFileSync(caCertPath, "utf8") + "\n";
-      for (const sysPath of ["/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem", "/etc/pki/tls/certs/ca-bundle.crt"]) {
-        try { combined += fs.readFileSync(sysPath, "utf8"); break; } catch {}
-      }
-      fs.writeFileSync(combinedPath, combined);
-    } catch { try { fs.copyFileSync(caCertPath, combinedPath); } catch {} }
-    env.NODE_EXTRA_CA_CERTS = combinedPath;
-    env.SSL_CERT_FILE = combinedPath;       // OpenSSL / Rust TLS
-    env.CURL_CA_BUNDLE = combinedPath;      // curl
-    env.REQUESTS_CA_BUNDLE = combinedPath;  // Python requests
-  }
-
   const proc = spawn(codexBin, args, { env, stdio: "inherit" });
   proc.on("close", (code) => process.exit(code || 0));
   proc.on("error", () => process.exit(1));
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// help & version
+// ═══════════════════════════════════════════════════════════════════════════
+
 function printHelp() {
-  console.log(`${NAME} — Node.js wrapper for OpenAI Codex CLI with proxy support.
+  console.log(`${NAME} ${VERSION} — proxy wrapper for OpenAI Codex CLI.
 
-  Two proxy modes:
-    1. Direct:   codex → static proxy → target
-    2. Split:    codex → local TLS proxy → [SSH tunnel] → edge proxy → target
-                 (terminates TLS locally, eliminates cross-Pacific handshake)
-
-  Commands:
-    proxy      Configure proxy & test connectivity
-    install    Install or update the OpenAI Codex CLI
-    run        Run codex with proxy applied
-
-  Any unrecognized command is passed directly to the codex CLI.
-
-  Quick start (direct mode):
-    ${NAME} proxy set http://user:pass@host:8080
-    ${NAME} proxy check                               # verify proxy works
-    ${NAME} run chat                                 # codex through proxy
+  Quick start:
+    ${NAME} proxy set http://user:pass@proxy:8080
+    ${NAME} proxy check
+    ${NAME} run chat
 
   Commands:
     ${NAME} proxy set <url>                          - configure upstream proxy
     ${NAME} proxy show                               - show current config
     ${NAME} proxy unset                              - clear proxy config
-    ${NAME} proxy check [--url URL] [--timeout S]     - full diagnostic & connectivity
-    ${NAME} split proxy set <url>                    - configure edge upstream proxy
-    ${NAME} split proxy show                         - show edge proxy config
-    ${NAME} split proxy unset                        - clear edge proxy config
-    ${NAME} split start [user@host]                  - start split daemon
-    ${NAME} split stop                               - stop local + remote daemons
-    ${NAME} split status                             - show daemon + tunnel status
-    ${NAME} split logs                               - show daemon logs
-    ${NAME} split check [--url URL] [--timeout S]    - diagnose split proxy chain
-    ${NAME} install [--force]                        - install both codex-relay & codex CLI
+    ${NAME} proxy check [--url URL] [--timeout S]     - test proxy connectivity
+    ${NAME} install [--force]                        - install codex-relay + codex CLI
     ${NAME} install --update                         - update codex CLI
     ${NAME} install --version X                      - install specific codex version
-    ${NAME} run <args...>                            - run codex with proxy
-    ${NAME} <anything>                               - passthrough to codex
+    ${NAME} run <args...>                            - run codex with proxy env vars
+    ${NAME} <anything>                               - passthrough to codex CLI
     ${NAME} --version                                - show version info`);
 }
 
 function printVersion() {
   console.log(`${NAME} ${VERSION}`);
   const cv = codexVersion();
-  console.log(cv ? `codex: ${cv}` : "codex: not found");
+  if (cv) console.log(`codex: ${cv}`);
 }
 
-// ── main ───────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// argument parsing
+// ═══════════════════════════════════════════════════════════════════════════
 
 function parseArgs(argv) {
   const opts = { _: [] };
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--url" || argv[i] === "--timeout" || argv[i] === "--version" ||
-        argv[i] === "--listen" || argv[i] === "--ssh-key") {
+    if (argv[i] === "--url" || argv[i] === "--timeout" || argv[i] === "--version") {
       opts[argv[i].replace(/^--/, "")] = argv[i + 1];
       i++;
     } else if (argv[i] === "--update") {
@@ -1729,19 +422,12 @@ function parseArgs(argv) {
   return opts;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// main
+// ═══════════════════════════════════════════════════════════════════════════
+
 async function main() {
   const raw = process.argv.slice(2);
-
-  // Hidden: daemon mode
-  if (raw[0] === "--_split-edge-daemon") {
-    runSplitEdgeDaemon();
-    return;
-  }
-  if (raw[0] === "--_split-local-daemon") {
-    runSplitLocalDaemon();
-    return;
-  }
-
   const cmd = raw[0];
   const args = raw.slice(1);
 
@@ -1770,10 +456,6 @@ async function main() {
       break;
     }
 
-    case "split":
-      cmdSplit(args);
-      break;
-
     case "install": {
       const pargs = parseArgs(args);
       await cmdInstall(pargs);
@@ -1791,6 +473,4 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  die(e.message);
-});
+main().catch((e) => { die(e.message); });
