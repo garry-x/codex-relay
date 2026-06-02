@@ -10,8 +10,9 @@
 //   codex-relay-forward 0.0.0.0:8443 http://proxy:8080  # full custom
 //
 // Env vars:
-//   FORWARD_LISTEN   listen address (default 0.0.0.0:8443)
+//   FORWARD_LISTEN   listen address (default 127.0.0.1:8443)
 //   FORWARD_PROXY    upstream proxy URL (overrides config.json)
+//   FORWARD_ALLOW    comma-separated CONNECT targets (default OpenAI hosts)
 
 const net = require("net");
 const fs = require("fs");
@@ -22,12 +23,22 @@ const os = require("os");
 
 const CONFIG_FILE = path.join(os.homedir(), ".codex-relay", "config.json");
 function loadConfig() {
-  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")); } catch { return {}; }
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
+  } catch (e) {
+    if (e.code === "ENOENT") return {};
+    console.error(`error: invalid config file ${CONFIG_FILE}: ${e.message}`);
+    process.exit(1);
+  }
 }
 
-const LISTEN = process.argv[2] || process.env.FORWARD_LISTEN || "0.0.0.0:8443";
+const LISTEN = process.argv[2] || process.env.FORWARD_LISTEN || "127.0.0.1:8443";
 const PROXY_URL = process.argv[3] || process.env.FORWARD_PROXY ||
                   loadConfig().https || loadConfig().http;
+const DEFAULT_ALLOW = "api.openai.com:443,chatgpt.com:443,auth.openai.com:443,cdn.openai.com:443";
+const ALLOW = (process.env.FORWARD_ALLOW || DEFAULT_ALLOW).split(",").map((v) => v.trim()).filter(Boolean);
+const HEADER_LIMIT = 16 * 1024;
+const IDLE_TIMEOUT_MS = 30000;
 
 if (!PROXY_URL) {
   console.error("error: no upstream proxy configured. Set FORWARD_PROXY env var,");
@@ -38,37 +49,79 @@ if (!PROXY_URL) {
 // ── helpers ────────────────────────────────────────────────────────────────
 
 function parseAddr(val) {
-  const i = val.lastIndexOf(":");
-  return { host: i > 0 ? val.slice(0, i) : "0.0.0.0", port: parseInt(val.slice(i + 1), 10) || 8080 };
+  const m = String(val).match(/^\[([^\]]+)\]:(\d+)$/);
+  if (m) return { host: m[1], port: parseInt(m[2], 10) };
+  const i = String(val).lastIndexOf(":");
+  if (i <= 0) return { host: "127.0.0.1", port: parseInt(val, 10) || 8443 };
+  return { host: val.slice(0, i), port: parseInt(val.slice(i + 1), 10) || 8443 };
 }
 
 function parseProxy(url) {
-  const s = url.replace(/^https?:\/\//, "");
-  const at = s.lastIndexOf("@");
-  const auth = at >= 0 ? s.slice(0, at) : "";
-  const hp = at >= 0 ? s.slice(at + 1) : s;
-  const ci = hp.lastIndexOf(":");
+  const u = new URL(url);
+  if (u.protocol !== "http:") throw new Error("only http upstream proxies are supported");
+  const auth = u.username || u.password ? `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}` : "";
   return {
-    host: ci >= 0 ? hp.slice(0, ci) : hp,
-    port: ci >= 0 ? parseInt(hp.slice(ci + 1), 10) : 8080,
+    host: u.hostname,
+    port: parseInt(u.port || "8080", 10),
     b64: auth ? Buffer.from(auth).toString("base64") : "",
   };
 }
 
+function redactUrl(value) {
+  try {
+    const u = new URL(value);
+    if (u.username || u.password) {
+      u.username = "***";
+      u.password = "";
+    }
+    return u.toString().replace("%2A%2A%2A", "***");
+  } catch {
+    return String(value).replace(/\/\/[^/@\s]+@/, "//***@");
+  }
+}
+
+function isAllowedTarget(host, port) {
+  const target = `${host}:${port}`.toLowerCase();
+  return ALLOW.some((entry) => {
+    const item = entry.toLowerCase();
+    if (item === target) return true;
+    if (item.startsWith("*.")) {
+      const suffix = item.slice(1);
+      return target.endsWith(suffix);
+    }
+    return false;
+  });
+}
+
 const addr = parseAddr(LISTEN);
-const proxy = parseProxy(PROXY_URL);
-const REDACTED = PROXY_URL.replace(/\/\/[^@]+@/, "//***@");
+let proxy;
+try {
+  proxy = parseProxy(PROXY_URL);
+} catch (e) {
+  console.error(`error: invalid upstream proxy: ${e.message}`);
+  process.exit(1);
+}
+const REDACTED = redactUrl(PROXY_URL);
 
 // ── server ─────────────────────────────────────────────────────────────────
 
 const server = net.createServer((client) => {
   client.setNoDelay(true);
+  client.setTimeout(IDLE_TIMEOUT_MS, () => client.destroy());
   client.once("data", (buf) => {
+    if (buf.length > HEADER_LIMIT) { client.end("HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n"); return; }
     const head = buf.toString();
     const m = head.match(/^CONNECT\s+(\S+):(\d+)\s+HTTP\//i);
     if (!m) { client.end("HTTP/1.1 400 Bad Request\r\n\r\n"); return; }
 
-    const target = `${m[1]}:${m[2]}`;
+    const targetHost = m[1].toLowerCase();
+    const targetPort = parseInt(m[2], 10);
+    if (!isAllowedTarget(targetHost, targetPort)) {
+      client.end("HTTP/1.1 403 Forbidden\r\n\r\n");
+      return;
+    }
+
+    const target = `${targetHost}:${targetPort}`;
     const upstream = net.connect(proxy.port, proxy.host, () => {
       let req = `CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n`;
       if (proxy.b64) req += `Proxy-Authorization: Basic ${proxy.b64}\r\n`;
@@ -76,18 +129,25 @@ const server = net.createServer((client) => {
       upstream.write(req);
     });
     upstream.setNoDelay(true);
+    upstream.setTimeout(IDLE_TIMEOUT_MS, () => upstream.destroy());
 
     let resp = Buffer.alloc(0);
     let done = false;
     upstream.on("data", (d) => {
       if (done) return;
       resp = Buffer.concat([resp, d]);
+      if (resp.length > HEADER_LIMIT) {
+        client.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        upstream.destroy();
+        return;
+      }
       const eoh = resp.indexOf("\r\n\r\n");
       if (eoh === -1) return;
       done = true;
       upstream.removeAllListeners("data");
 
-      if (!resp.toString("utf8", 0, resp.indexOf("\r\n")).includes("200")) {
+      const status = resp.toString("utf8", 0, resp.indexOf("\r\n"));
+      if (!/^HTTP\/\d(?:\.\d)? 200\b/.test(status)) {
         client.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
         upstream.destroy();
         return;

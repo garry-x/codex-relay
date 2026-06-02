@@ -5,7 +5,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { spawn, execSync } = require("child_process");
+const { spawn, execFileSync } = require("child_process");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // config
@@ -45,24 +45,81 @@ function info(msg) {
 }
 
 function loadConfig() {
-  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")); } catch { return {}; }
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
+  } catch (e) {
+    if (e.code === "ENOENT") return {};
+    die(`invalid config file ${CONFIG_FILE}: ${e.message}`);
+  }
 }
 function saveConfig(cfg) {
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
+  fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(CONFIG_DIR, 0o700); } catch {}
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  try { fs.chmodSync(CONFIG_FILE, 0o600); } catch {}
 }
 
 function findCodex() {
-  try { return execSync("which codex", { encoding: "utf8" }).trim(); } catch { return null; }
+  try { return execFileSync("which", ["codex"], { encoding: "utf8" }).trim(); } catch { return null; }
 }
 function codexVersion() {
   const bin = findCodex();
   if (!bin) return null;
-  try { return execSync(`"${bin}" --version`, { encoding: "utf8", timeout: 5000 }).trim(); } catch { return null; }
+  try { return execFileSync(bin, ["--version"], { encoding: "utf8", timeout: 5000 }).trim(); } catch { return null; }
 }
 
 function shutil(name) {
-  try { execSync(`which ${name}`, { encoding: "utf8", stdio: "ignore" }); return true; } catch { return false; }
+  try { execFileSync("which", [name], { encoding: "utf8", stdio: "ignore" }); return true; } catch { return false; }
+}
+
+function redactUrl(value) {
+  if (!value) return value;
+  try {
+    const u = new URL(value);
+    if (u.username || u.password) {
+      u.username = "***";
+      u.password = "";
+    }
+    return u.toString().replace("%2A%2A%2A", "***");
+  } catch {
+    return String(value).replace(/\/\/[^/@\s]+@/, "//***@");
+  }
+}
+
+function resolveProxy(cfg = loadConfig(), env = process.env) {
+  return env.HTTPS_PROXY || env.https_proxy ||
+         env.HTTP_PROXY || env.http_proxy ||
+         cfg.https || cfg.http || "";
+}
+
+function withProxyEnv(env, proxyUrl) {
+  if (!proxyUrl) return env;
+  const noProxy = "localhost,127.0.0.1,::1,.local";
+  return {
+    ...env,
+    HTTP_PROXY: proxyUrl,
+    HTTPS_PROXY: proxyUrl,
+    http_proxy: proxyUrl,
+    https_proxy: proxyUrl,
+    WS_PROXY: proxyUrl,
+    WSS_PROXY: proxyUrl,
+    NO_PROXY: noProxy,
+    no_proxy: noProxy,
+  };
+}
+
+function runChecked(bin, args, opts = {}) {
+  return execFileSync(bin, args, { encoding: "utf8", stdio: "pipe", ...opts });
+}
+
+function waitForClose(proc) {
+  return new Promise((resolve, reject) => {
+    proc.on("error", reject);
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`command exited with code ${code}`));
+    });
+  });
 }
 
 // Detect the shell config file for PATH setup.
@@ -77,11 +134,12 @@ function detectShellRc() {
     }
     try {
       if (process.platform === "darwin") {
-        const out = execSync(`dscl . -read /Users/${SUDO_USER} UserShell 2>/dev/null`, { encoding: "utf8", timeout: 2000 });
+        const out = execFileSync("dscl", [".", "-read", `/Users/${SUDO_USER}`, "UserShell"], { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"] });
         const m = out.match(/UserShell:\s*(\S+)/);
         if (m) shell = m[1];
       } else {
-        shell = execSync(`getent passwd ${SUDO_USER} 2>/dev/null | cut -d: -f7`, { encoding: "utf8", timeout: 2000 }).trim() || shell;
+        const passwd = execFileSync("getent", ["passwd", SUDO_USER], { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"] });
+        shell = (passwd.split(":")[6] || "").trim() || shell;
       }
     } catch {}
   }
@@ -109,16 +167,19 @@ function cmdProxySet(url) {
   cfg.http = url;
   cfg.https = url;
   saveConfig(cfg);
-  info(`proxy set to: ${url}`);
+  info(`proxy set to: ${redactUrl(url)}`);
 }
 
 function cmdProxyShow() {
   const cfg = loadConfig();
-  if (process.env.HTTP_PROXY) console.log(`env proxy:       ${process.env.HTTP_PROXY}`);
-  else if (process.env.http_proxy) console.log(`env proxy:       ${process.env.http_proxy}`);
-  if (cfg.http) console.log(`config proxy:    ${cfg.http}`);
-  if (cfg.http || process.env.HTTP_PROXY || process.env.http_proxy) {
-    console.log(`effective proxy: ${cfg.http || process.env.HTTP_PROXY || process.env.http_proxy}`);
+  const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy ||
+                   process.env.HTTP_PROXY || process.env.http_proxy;
+  const configProxy = cfg.https || cfg.http;
+  const effective = resolveProxy(cfg);
+  if (envProxy) console.log(`env proxy:       ${redactUrl(envProxy)}`);
+  if (configProxy) console.log(`config proxy:    ${redactUrl(configProxy)}`);
+  if (effective) {
+    console.log(`effective proxy: ${redactUrl(effective)}`);
   } else {
     console.log("effective proxy: none");
   }
@@ -134,7 +195,8 @@ function cmdProxyUnset() {
 
 function cmdProxyCheck(opts = {}) {
   const testUrl = opts.url || "https://api.openai.com";
-  const timeout = opts.timeout || 10;
+  const timeout = Number(opts.timeout || 10);
+  if (!Number.isFinite(timeout) || timeout <= 0) die("--timeout must be a positive number");
 
   const issues = [];
   const ok = [];
@@ -145,10 +207,8 @@ function cmdProxyCheck(opts = {}) {
   };
 
   const cfg = loadConfig();
-  const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy ||
-                   process.env.HTTP_PROXY || process.env.http_proxy ||
-                   cfg.https || cfg.http;
-  check("proxy config", !!proxyUrl, proxyUrl || "not configured — run: proxy set <url>");
+  const proxyUrl = resolveProxy(cfg);
+  check("proxy config", !!proxyUrl, redactUrl(proxyUrl) || "not configured — run: proxy set <url>");
 
   const haveCurl = !!shutil("curl");
   check("curl", haveCurl, haveCurl ? "available" : "not found — required for proxy check");
@@ -156,10 +216,15 @@ function cmdProxyCheck(opts = {}) {
   if (proxyUrl && haveCurl) {
     const start = Date.now();
     try {
-      const out = execSync(
-        `curl -s -o /dev/null -w '%{http_code}' --proxy '${proxyUrl}' --connect-timeout ${timeout} --max-time ${timeout} '${testUrl}'`,
-        { encoding: "utf8", timeout: (timeout + 5) * 1000 }
-      ).trim();
+      const out = runChecked("curl", [
+        "-s",
+        "-o", "/dev/null",
+        "-w", "%{http_code}",
+        "--proxy", proxyUrl,
+        "--connect-timeout", String(timeout),
+        "--max-time", String(timeout),
+        testUrl,
+      ], { timeout: (timeout + 5) * 1000 }).trim();
       const latency = Date.now() - start;
       const code = parseInt(out, 10);
       check("proxy connectivity", code >= 200 && code < 500, `HTTP ${out}, ${latency}ms → ${testUrl}`);
@@ -269,7 +334,7 @@ async function cmdInstallSelf(opts = {}) {
     const inPath = process.env.PATH.split(":").some((p) => path.resolve(p) === path.resolve(binDir));
     let findable = false;
     try {
-      execSync(`command -v ${NAME}`, { encoding: "utf8", timeout: 2000 }).trim();
+      execFileSync("which", [NAME], { encoding: "utf8", timeout: 2000 }).trim();
       findable = true;
     } catch {}
 
@@ -307,39 +372,31 @@ async function cmdInstallSelf(opts = {}) {
 
 async function cmdInstallCodex(env, version) {
   const npm = "npm";
-  try { execSync("which npm", { encoding: "utf8" }); } catch { die("npm not found. Install Node.js: https://nodejs.org"); }
+  try { execFileSync("which", ["npm"], { encoding: "utf8" }); } catch { die("npm not found. Install Node.js: https://nodejs.org"); }
 
   let pkg = "@openai/codex";
   if (version) pkg += `@${version}`;
   info(`installing ${pkg} ...`);
   const proc = spawn(npm, ["install", "-g", pkg], { env, stdio: "inherit" });
-  await new Promise((res) => proc.on("close", res));
+  await waitForClose(proc);
   const ver = codexVersion();
   info(`installed: ${ver || "latest"}`);
 }
 
 async function cmdUpdateCodex(env) {
   const npm = "npm";
-  try { execSync("which npm", { encoding: "utf8" }); } catch { die("npm not found. Install Node.js: https://nodejs.org"); }
+  try { execFileSync("which", ["npm"], { encoding: "utf8" }); } catch { die("npm not found. Install Node.js: https://nodejs.org"); }
   info("updating @openai/codex ...");
   const proc = spawn(npm, ["update", "-g", "@openai/codex"], { env, stdio: "inherit" });
-  await new Promise((res) => proc.on("close", res));
+  await waitForClose(proc);
   const ver = codexVersion();
   info(`updated: ${ver || "latest"}`);
 }
 
 async function cmdInstall(opts = {}) {
   const cfg = loadConfig();
-  const proxyUrl = cfg.https || cfg.http;
-  const env = { ...process.env };
-  if (proxyUrl) {
-    env.HTTP_PROXY = proxyUrl;
-    env.HTTPS_PROXY = proxyUrl;
-    env.http_proxy = proxyUrl;
-    env.https_proxy = proxyUrl;
-    env.NO_PROXY = "localhost,127.0.0.1,::1,.local";
-    env.no_proxy = "localhost,127.0.0.1,::1,.local";
-  }
+  const proxyUrl = resolveProxy(cfg);
+  const env = withProxyEnv({ ...process.env }, proxyUrl);
 
   if (opts.update) { await cmdUpdateCodex(env); return; }
   if (opts.version) { await cmdInstallCodex(env, opts.version); return; }
@@ -362,24 +419,10 @@ async function cmdInstall(opts = {}) {
 function cmdRun(args) {
   const codexBin = findCodex() || die("'codex' not found. Install with: codex-relay install");
 
-  const env = { ...process.env };
-  const noProxy = "localhost,127.0.0.1,::1,.local";
-
   const cfg = loadConfig();
-  const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy ||
-                   process.env.HTTP_PROXY || process.env.http_proxy ||
-                   cfg.https || cfg.http;
-  if (proxyUrl) {
-    env.HTTP_PROXY = proxyUrl;
-    env.HTTPS_PROXY = proxyUrl;
-    env.http_proxy = proxyUrl;
-    env.https_proxy = proxyUrl;
-    env.WS_PROXY = proxyUrl;
-    env.WSS_PROXY = proxyUrl;
-    env.NO_PROXY = noProxy;
-    env.no_proxy = noProxy;
-    info(`using proxy: ${proxyUrl}`);
-  }
+  const proxyUrl = resolveProxy(cfg);
+  const env = withProxyEnv({ ...process.env }, proxyUrl);
+  if (proxyUrl) info(`using proxy: ${redactUrl(proxyUrl)}`);
 
   const proc = spawn(codexBin, args, { env, stdio: "inherit" });
   proc.on("close", (code) => process.exit(code || 0));
@@ -442,6 +485,10 @@ function parseArgs(argv) {
   return opts;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // CLI: vps
 // ═══════════════════════════════════════════════════════════════════════════
@@ -451,10 +498,10 @@ function _vpsExec(cmd) {
   const cfg = loadConfig();
   const dest = process.argv.includes("--ssh") ? process.argv[process.argv.indexOf("--ssh") + 1] : cfg.vps?.ssh;
   if (!dest) die("no VPS configured. Run: codex-relay vps setup <user@host>");
-  const keyArg = cfg.vps?.key ? ["-i", cfg.vps.key] : [];
-  const sshArgs = `-o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")}`.trim();
+  const sshArgs = ["-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no"];
+  if (cfg.vps?.key) sshArgs.push("-i", cfg.vps.key);
   try {
-    return execSync(`ssh ${sshArgs} '${dest}' ${JSON.stringify(cmd + "; true")}`, { encoding: "utf8", timeout: 15000, stdio: "pipe" });
+    return execFileSync("ssh", [...sshArgs, dest, cmd], { encoding: "utf8", timeout: 15000, stdio: "pipe" });
   } catch (e) {
     // Always return combined output regardless of exit code
     return (e.stdout || "") + (e.stderr || "");
@@ -477,27 +524,27 @@ function cmdVpsSetup(target) {
   info(`VPS configured: ${target}`);
 
   // Deploy forwarder — try local file first, fall back to GitHub
-  const keyArg = key ? ["-i", key] : [];
+  const sshArgs = ["-o", "StrictHostKeyChecking=no"];
+  if (key) sshArgs.push("-i", key);
   const scriptDir = path.dirname(SCRIPT_PATH);
   const forwarderPath = path.join(scriptDir, "codex-relay-forward");
-  let deployCmd = "";
-
-  if (fs.existsSync(forwarderPath)) {
-    // Local file available — scp it
-    deployCmd = `scp -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${forwarderPath}' '${target}:/usr/local/bin/'`;
-  } else {
-    // Download from GitHub
-    const url = "https://raw.githubusercontent.com/garry-x/codex-relay/main/codex-relay-forward";
-    deployCmd = `ssh -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${target}' "curl -fsSLo /usr/local/bin/codex-relay-forward '${url}' && chmod +x /usr/local/bin/codex-relay-forward"`;
-  }
 
   info("deploying codex-relay-forward...");
-  try { execSync(deployCmd, { encoding: "utf8", timeout: 15000, stdio: "pipe" }); }
-  catch (e) { die(`deploy failed: ${e.message}`); }
+  if (fs.existsSync(forwarderPath)) {
+    try {
+      execFileSync("scp", [...sshArgs, forwarderPath, `${target}:/usr/local/bin/`], { encoding: "utf8", timeout: 15000, stdio: "pipe" });
+      execFileSync("ssh", [...sshArgs, target, "chmod +x /usr/local/bin/codex-relay-forward"], { encoding: "utf8", timeout: 15000, stdio: "pipe" });
+    } catch (e) { die(`deploy failed: ${e.message}`); }
+  } else {
+    const url = "https://raw.githubusercontent.com/garry-x/codex-relay/main/codex-relay-forward";
+    try {
+      execFileSync("ssh", [...sshArgs, target, `curl -fsSLo /usr/local/bin/codex-relay-forward '${url}' && chmod +x /usr/local/bin/codex-relay-forward`], { encoding: "utf8", timeout: 15000, stdio: "pipe" });
+    } catch (e) { die(`deploy failed: ${e.message}`); }
+  }
 
   // Start forwarder via ssh (detached: nohup + </dev/null to avoid pipe fd leak)
   try {
-    execSync(`ssh -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${target}' "nohup codex-relay-forward 0.0.0.0:8443 </dev/null >/tmp/codex-relay-forward.log 2>&1 &"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" });
+    execFileSync("ssh", [...sshArgs, target, "nohup codex-relay-forward 0.0.0.0:8443 </dev/null >/tmp/codex-relay-forward.log 2>&1 &"], { encoding: "utf8", timeout: 10000, stdio: "pipe" });
     info("forwarder started");
   } catch (e) { info(`start via ssh failed — run codex-relay vps start`); }
 
@@ -507,8 +554,9 @@ function cmdVpsSetup(target) {
 function cmdVpsProxy(action, url) {
   if (action === "set") {
     if (!url) die("usage: codex-relay vps proxy set <url>");
-    _vpsExec(`mkdir -p ~/.codex-relay && node -e "var c=require('/root/.codex-relay/config.json')||{};c.http='${url}';c.https='${url}';require('fs').writeFileSync('/root/.codex-relay/config.json',JSON.stringify(c))"`);
-    info(`VPS proxy set to: ${url}`);
+    const payload = Buffer.from(JSON.stringify({ http: url, https: url })).toString("base64");
+    _vpsExec(`mkdir -p ~/.codex-relay && chmod 700 ~/.codex-relay && printf '%s' '${payload}' | base64 -d > ~/.codex-relay/config.json && chmod 600 ~/.codex-relay/config.json`);
+    info(`VPS proxy set to: ${redactUrl(url)}`);
   } else {
     const out = _vpsExecNoFail("cat ~/.codex-relay/config.json 2>/dev/null || echo '{}'");
     const cfg = (() => { try { return JSON.parse(out); } catch { return {}; } })();
@@ -517,20 +565,20 @@ function cmdVpsProxy(action, url) {
   }
 }
 
-function cmdVpsStart() {
+async function cmdVpsStart() {
   const cfg = loadConfig();
   const dest = cfg.vps?.ssh;
   if (!dest) die("no VPS configured. Run: codex-relay vps setup <user@host>");
-  const keyArg = cfg.vps?.key ? ["-i", cfg.vps.key] : [];
-  const sshArgs = `-o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")}`.trim();
+  const sshArgs = ["-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no"];
+  if (cfg.vps?.key) sshArgs.push("-i", cfg.vps.key);
 
   // Start detached: nohup + </dev/null avoids pipe fd leak
-  try { execSync(`ssh ${sshArgs} '${dest}' "nohup codex-relay-forward 0.0.0.0:8443 </dev/null >/tmp/codex-relay-forward.log 2>&1 &"`, { encoding: "utf8", timeout: 10000, stdio: "pipe" }); }
+  try { execFileSync("ssh", [...sshArgs, dest, "nohup codex-relay-forward 0.0.0.0:8443 </dev/null >/tmp/codex-relay-forward.log 2>&1 &"], { encoding: "utf8", timeout: 10000, stdio: "pipe" }); }
   catch (e) { die(`VPS start failed: ${e.message}`); }
 
   // Wait and check
   for (let i = 0; i < 6; i++) {
-    execSync("sleep 0.5", { stdio: "ignore" });
+    await sleep(500);
     const status = _vpsExecNoFail("ss -tlnp | grep 8443");
     if (status.trim()) {
       info(`VPS forwarder started:\n${status.trim()}`);
@@ -599,7 +647,7 @@ async function main() {
       switch (action) {
         case "setup": cmdVpsSetup(pargs._[0]); break;
         case "proxy": cmdVpsProxy(pargs._[0], pargs._[1]); break;
-        case "start": cmdVpsStart(); break;
+        case "start": await cmdVpsStart(); break;
         case "stop": cmdVpsStop(); break;
         case "status": cmdVpsStatus(); break;
         case "logs": cmdVpsLogs(); break;

@@ -39,6 +39,10 @@ codex-relay chat
 | `proxy show` | 显示当前代理配置和生效状态 |
 | `proxy unset` | 清除代理配置 |
 | `proxy check [--url URL] [--timeout S]` | 全链路诊断：代理配置、curl、连通性、npm、codex |
+| `vps setup <user@host> [--key path]` | 部署 `codex-relay-forward` 到 VPS |
+| `vps proxy set <url>` | 设置 VPS 上游静态代理 |
+| `vps proxy show` | 显示 VPS 上游代理 |
+| `vps start\|stop\|status\|logs` | 管理 VPS 转发器 |
 | `install [--force]` | 安装 codex-relay + Codex CLI |
 | `install --update` | 更新 Codex CLI |
 | `install --version X` | 安装指定版本 Codex CLI |
@@ -79,7 +83,7 @@ EOF
 ### 4. 启动
 
 ```bash
-# 前台测试
+# 前台测试（显式监听 Tailscale IP 或 0.0.0.0）
 codex-relay-forward <vps-tailscale-ip>:8443
 
 # 后台运行
@@ -198,5 +202,24 @@ codex-relay run doctor
 |---|---|---|
 | `HTTP_PROXY` / `HTTPS_PROXY` | 本机 | 优先于 config.json，指向 VPS Tailscale IP |
 | `FORWARD_PROXY` | VPS | forwarder 使用的上游代理，优先于 config.json |
-| `FORWARD_LISTEN` | VPS | forwarder 监听地址，默认 `0.0.0.0:8443` |
+| `FORWARD_LISTEN` | VPS | forwarder 监听地址，默认 `127.0.0.1:8443`；VPS 部署时建议显式传 Tailscale IP |
+| `FORWARD_ALLOW` | VPS | 允许 CONNECT 的目标，逗号分隔；默认 `api.openai.com:443,chatgpt.com:443,auth.openai.com:443,cdn.openai.com:443` |
 | `NODE_EXTRA_CA_CERTS` | — | 不再需要（不进行 TLS 终止） |
+
+## 安全说明
+
+- `~/.codex-relay` 会以 `0700` 创建，`config.json` 会以 `0600` 写入，避免代理账号密码被其他本机用户读取。
+- 日志和 `proxy show` 会脱敏 `user:pass@proxy` 中的认证信息。
+- `codex-relay-forward` 默认只监听 `127.0.0.1:8443`。在 VPS 上运行时请显式监听 Tailscale IP，例如 `codex-relay-forward <vps-tailscale-ip>:8443`。
+- `codex-relay-forward` 默认只允许连接常见 OpenAI/Codex 相关域名。如需扩展：
+
+```bash
+export FORWARD_ALLOW="api.openai.com:443,chatgpt.com:443,*.openai.com:443"
+```
+
+## 开发检查
+
+```bash
+npm run check
+npm test
+```
