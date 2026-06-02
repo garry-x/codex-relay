@@ -1433,6 +1433,16 @@ async function cmdInstallSelf(opts = {}) {
   try {
     fs.writeFileSync(dest, scriptContent, { mode: 0o755 });
 
+    // Also install codex-relay-split wrapper
+    const splitDest = path.join(binDir, "codex-relay-split");
+    const splitScriptPath = path.join(path.dirname(SCRIPT_PATH), "codex-relay-split");
+    try {
+      if (fs.existsSync(splitScriptPath)) {
+        const splitContent = fs.readFileSync(splitScriptPath, "utf8");
+        fs.writeFileSync(splitDest, splitContent, { mode: 0o755 });
+      }
+    } catch {}
+
     // Check if the binary is findable right now
     const inPath = process.env.PATH.split(":").some((p) => path.resolve(p) === path.resolve(binDir));
     let findable = false;
