@@ -68,9 +68,9 @@ Split 模式的核心原理：把 TLS 握手拆成两段——本地段（localh
 # 1. 把 codex-relay 复制到 VPS
 scp codex-relay root@your-vps:/usr/local/bin/
 
-# 2. 如果 VPS 需要通过代理访问外网，先配置静态代理
+# 2. 如果 VPS 需要通过代理访问外网，配置 edge 上游代理
 ssh root@your-vps
-codex-relay proxy set http://user:pass@vps-proxy:8080   # 可选
+codex-relay split proxy set http://user:pass@vps-proxy:8080   # 可选
 
 # 3. 启动 edge proxy（自动检测 edge 模式）
 codex-relay split start
@@ -116,9 +116,10 @@ codex-relay run chat
 
 | 命令 | 用途 |
 |---|---|
-| `split start --edge` | 后台启动 VPS edge 守护进程 |
-| `split start --ssh user@host` | 后台启动本地代理（自动 SSH 隧道 + 远端 edge） |
-| `split stop` | 停止所有 split 守护进程和 SSH 隧道 |
+| `split proxy set <url>` | 配置 edge 上游静态代理 |
+| `split proxy show / unset` | 查看 / 清除 edge 代理配置 |
+| `split start [user@host]` | 启动守护进程（自动识别 local/edge 模式） |
+| `split stop` | 停止本地 + 远端守护进程 |
 | `split status` | 查看 local、edge、SSH 隧道状态 |
 | `split logs` | 查看守护进程日志 |
 | `split check [--url URL] [--timeout S]` | 端到端诊断 |

@@ -798,8 +798,6 @@ function cmdSplit(args) {
       const listen = opts.listen || cfg.split?.edge_listen || "127.0.0.1:19090";
       cfg.split = cfg.split || {};
       cfg.split.edge_listen = listen;
-      // If proxy was set (for edge upstream), save to edge_proxy
-      if (cfg.http) { cfg.split.edge_proxy = cfg.http; delete cfg.http; delete cfg.https; }
       saveConfig(cfg);
       _splitDaemonStart("edge", [SCRIPT_PATH, "--_split-edge-daemon"]);
       return;
@@ -838,12 +836,40 @@ function cmdSplit(args) {
       cmdSplitLogs();
       break;
 
+    case "proxy": {
+      const sub = opts._[0];
+      if (sub === "set") {
+        const url = opts._[1];
+        if (!url) die(`usage: ${NAME} split proxy set <url>`);
+        const cfg = loadConfig();
+        cfg.split = cfg.split || {};
+        cfg.split.edge_proxy = url;
+        saveConfig(cfg);
+        info(`split edge proxy set to: ${url}`);
+      } else if (!sub || sub === "show") {
+        const cfg = loadConfig();
+        if (cfg.split?.edge_proxy) {
+          console.log(cfg.split.edge_proxy);
+        } else {
+          console.log("(no edge proxy configured)");
+        }
+      } else if (sub === "unset" || sub === "clear") {
+        const cfg = loadConfig();
+        if (cfg.split) delete cfg.split.edge_proxy;
+        saveConfig(cfg);
+        info("split edge proxy cleared.");
+      } else {
+        die(`usage: ${NAME} split proxy {set|show|unset}`);
+      }
+      break;
+    }
+
     case "check":
       cmdSplitCheck(opts);
       break;
 
     default:
-      die(`usage: ${NAME} split {start|stop|status|logs|check}`);
+      die(`usage: ${NAME} split {start|stop|status|logs|proxy|check}`);
   }
 }
 
@@ -1260,6 +1286,9 @@ function printHelp() {
     ${NAME} proxy show                               - show current config
     ${NAME} proxy unset                              - clear proxy config
     ${NAME} proxy check [--url URL] [--timeout S]     - full diagnostic & connectivity
+    ${NAME} split proxy set <url>                    - configure edge upstream proxy
+    ${NAME} split proxy show                         - show edge proxy config
+    ${NAME} split proxy unset                        - clear edge proxy config
     ${NAME} split start [user@host]                  - start split daemon
     ${NAME} split stop                               - stop local + remote daemons
     ${NAME} split status                             - show daemon + tunnel status
