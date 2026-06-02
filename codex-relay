@@ -13,7 +13,7 @@ const { spawn, execSync } = require("child_process");
 // ── config ─────────────────────────────────────────────────────────────────
 
 const NAME = "codex-relay";
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const UPDATE_URL = "https://raw.githubusercontent.com/garry-x/codex-relay/main/codex-relay";
 
 // When running via sudo, use the original user's home, not /var/root
@@ -978,12 +978,16 @@ function cmdSplit(args) {
       });
       break;
 
+    case "version":
+      console.log(`${NAME} ${VERSION}`);
+      break;
+
     case "check":
       cmdSplitCheck(opts);
       break;
 
     default:
-      die(`usage: ${NAME} split {start|stop|status|logs|proxy|update|check}`);
+      die(`usage: ${NAME} split {start|stop|status|logs|proxy|update|version|check}`);
   }
 }
 
