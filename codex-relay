@@ -178,6 +178,16 @@ function cmdProxyCheck(opts = {}) {
   const codexBin = findCodex();
   check("codex CLI", !!codexBin, codexBin ? codexVersion() : "not installed — run: install");
 
+  // 6. VPS forwarder status (if configured)
+  if (cfg.vps?.ssh) {
+    try {
+      const out = _vpsExecNoFail("ss -tlnp | grep 8443");
+      check("vps forwarder", !!out.trim(), out.trim() || "not running — run: codex-relay vps start");
+    } catch {
+      check("vps forwarder", false, "SSH unreachable");
+    }
+  }
+
   console.log("codex-relay proxy check\n");
   for (const item of ok) console.log(`  ✓ ${item}`);
   if (issues.length > 0) {
@@ -387,6 +397,10 @@ function printHelp() {
     ${NAME} proxy show                               - show current config
     ${NAME} proxy unset                              - clear proxy config
     ${NAME} proxy check [--url URL] [--timeout S]     - test proxy connectivity
+    ${NAME} vps setup <user@host> [--key path]       - deploy forwarder to VPS
+    ${NAME} vps proxy set <url>                      - set static proxy on VPS
+    ${NAME} vps proxy show                           - show VPS proxy config
+    ${NAME} vps start|stop|status|logs               - manage VPS forwarder
     ${NAME} install [--force]                        - install codex-relay + codex CLI
     ${NAME} install --update                         - update codex CLI
     ${NAME} install --version X                      - install specific codex version
@@ -423,6 +437,91 @@ function parseArgs(argv) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// CLI: vps
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Run a command on the VPS via SSH. Returns stdout or throws.
+function _vpsExec(cmd) {
+  const cfg = loadConfig();
+  const dest = process.argv.includes("--ssh") ? process.argv[process.argv.indexOf("--ssh") + 1] : cfg.vps?.ssh;
+  if (!dest) die("no VPS configured. Run: codex-relay vps setup <user@host>");
+  const keyArg = cfg.vps?.key ? ["-i", cfg.vps.key] : [];
+  return execSync(`ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${dest}' ${JSON.stringify(cmd)}`, { encoding: "utf8", timeout: 15000, stdio: "pipe" });
+}
+
+function _vpsExecNoFail(cmd) {
+  try { return _vpsExec(cmd).trim(); } catch { return ""; }
+}
+
+function cmdVpsSetup(target) {
+  if (!target || !target.includes("@")) die("usage: codex-relay vps setup <user@host> [--key <path>]");
+  const keyIdx = process.argv.indexOf("--key");
+  const key = keyIdx >= 0 ? process.argv[keyIdx + 1] : "";
+
+  const cfg = loadConfig();
+  cfg.vps = { ssh: target };
+  if (key) cfg.vps.key = key;
+  saveConfig(cfg);
+  info(`VPS configured: ${target}`);
+
+  // Deploy forwarder
+  info("deploying codex-relay-forward...");
+  const keyArg = key ? ["-i", key] : [];
+  try {
+    const scriptDir = path.dirname(SCRIPT_PATH);
+    const forwarderPath = path.join(scriptDir, "codex-relay-forward");
+    if (!fs.existsSync(forwarderPath)) die("codex-relay-forward not found in " + scriptDir);
+    execSync(`scp -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${forwarderPath}' '${target}:/usr/local/bin/'`, { encoding: "utf8", timeout: 15000, stdio: "pipe" });
+  } catch (e) { die(`deploy failed: ${e.message}`); }
+
+  // Start forwarder
+  try {
+    const out = _vpsExec("pkill -f codex-relay-forward 2>/dev/null; sleep 0.3; nohup codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1 & sleep 1; ss -tlnp | grep 8443");
+    info(out.trim());
+  } catch (e) { info(`start failed — run manually on VPS: codex-relay-forward 0.0.0.0:8443`); }
+
+  info("VPS setup complete.");
+}
+
+function cmdVpsProxy(action, url) {
+  if (action === "set") {
+    if (!url) die("usage: codex-relay vps proxy set <url>");
+    _vpsExec(`mkdir -p ~/.codex-relay && node -e "var c=require('/root/.codex-relay/config.json')||{};c.http='${url}';c.https='${url}';require('fs').writeFileSync('/root/.codex-relay/config.json',JSON.stringify(c))"`);
+    info(`VPS proxy set to: ${url}`);
+  } else {
+    const out = _vpsExecNoFail("cat ~/.codex-relay/config.json 2>/dev/null || echo '{}'");
+    const cfg = (() => { try { return JSON.parse(out); } catch { return {}; } })();
+    if (cfg.http) console.log(cfg.http);
+    else console.log("(no proxy configured on VPS)");
+  }
+}
+
+function cmdVpsStart() {
+  const out = _vpsExec("nohup codex-relay-forward 0.0.0.0:8443 > /tmp/codex-relay-forward.log 2>&1 & sleep 1; ss -tlnp | grep 8443 || echo 'FAILED'");
+  if (out.includes("FAILED")) die("VPS forwarder failed to start. Check: ssh vps \"cat /tmp/codex-relay-forward.log\"");
+  info(`VPS forwarder started:\n${out.trim()}`);
+}
+
+function cmdVpsStop() {
+  _vpsExecNoFail("pkill -f codex-relay-forward");
+  info("VPS forwarder stopped.");
+}
+
+function cmdVpsStatus() {
+  const out = _vpsExecNoFail("ss -tlnp | grep 8443; echo '---'; cat /tmp/codex-relay-forward.log 2>/dev/null | tail -1; echo '---'; cat ~/.codex-relay/config.json 2>/dev/null || echo '{}'");
+  const parts = out.split("---");
+  console.log(parts[0].trim() ? `forwarder:  running\n${parts[0].trim()}` : "forwarder:  stopped");
+  if (parts[1]?.trim()) console.log(`last log:   ${parts[1].trim()}`);
+  const pcfg = (() => { try { return JSON.parse(parts[2] || "{}"); } catch { return {}; } })();
+  console.log(`upstream:   ${pcfg.http || "(not configured)"}`);
+}
+
+function cmdVpsLogs() {
+  const out = _vpsExecNoFail("tail -30 /tmp/codex-relay-forward.log 2>/dev/null");
+  console.log(out || "(no logs)");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // main
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -452,6 +551,21 @@ async function main() {
         case "unset": cmdProxyUnset(); break;
         case "check": cmdProxyCheck(pargs); break;
         default: die(`usage: ${NAME} proxy {set|show|unset|check}`);
+      }
+      break;
+    }
+
+    case "vps": {
+      const action = args[0];
+      const pargs = parseArgs(args.slice(1));
+      switch (action) {
+        case "setup": cmdVpsSetup(pargs._[0]); break;
+        case "proxy": cmdVpsProxy(pargs._[0], pargs._[1]); break;
+        case "start": cmdVpsStart(); break;
+        case "stop": cmdVpsStop(); break;
+        case "status": cmdVpsStatus(); break;
+        case "logs": cmdVpsLogs(); break;
+        default: die(`usage: ${NAME} vps {setup|proxy|start|stop|status|logs}`);
       }
       break;
     }
