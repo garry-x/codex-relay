@@ -20,7 +20,7 @@ codex CLI  ──→  HTTP_PROXY  ──→  VPS forwarder  ──→  static pr
 codex-relay install
 
 # 2. 配置代理（指向 VPS 的 Tailscale IP:端口）
-codex-relay proxy set http://100.114.41.104:8443
+codex-relay proxy set http://<vps-tailscale-ip>:8443
 
 # 3. 验证连通性
 codex-relay proxy check
@@ -80,15 +80,15 @@ EOF
 
 ```bash
 # 前台测试
-codex-relay-forward 100.114.41.104:8443
+codex-relay-forward <vps-tailscale-ip>:8443
 
 # 后台运行
-nohup codex-relay-forward 100.114.41.104:8443 &
+nohup codex-relay-forward <vps-tailscale-ip>:8443 &
 ```
 
 输出示例：
 ```
-[codex-relay-forward] 100.114.41.104:8443 → http://***@static-proxy:8080
+[codex-relay-forward] <vps-tailscale-ip>:8443 → http://***@static-proxy:8080
 ```
 
 ### 5. systemd 持久化
@@ -99,7 +99,7 @@ Description=codex-relay TCP forwarder
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/codex-relay-forward 100.114.41.104:8443
+ExecStart=/usr/local/bin/codex-relay-forward <vps-tailscale-ip>:8443
 Restart=always
 RestartSec=5
 Environment=FORWARD_PROXY=http://user:pass@static-proxy:8080
@@ -139,8 +139,8 @@ systemctl enable --now codex-relay-forward
 
 ```json
 {
-  "http": "http://100.114.41.104:8443",
-  "https": "http://100.114.41.104:8443"
+  "http": "http://<vps-tailscale-ip>:8443",
+  "https": "http://<vps-tailscale-ip>:8443"
 }
 ```
 
@@ -155,7 +155,7 @@ systemctl enable --now codex-relay-forward
 codex-relay proxy check
 
 # 手动测试转发链路
-curl -v --proxy http://100.114.41.104:8443 https://api.openai.com -o /dev/null
+curl -v --proxy http://<vps-tailscale-ip>:8443 https://api.openai.com -o /dev/null
 
 # 检查 VPS forwarder 状态
 ssh root@vps "ss -tlnp | grep 8443"

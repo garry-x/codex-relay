@@ -6,7 +6,7 @@
 //
 // Usage:
 //   codex-relay-forward                             # reads proxy from config.json
-//   codex-relay-forward 100.114.41.104:8443         # custom listen addr
+//   codex-relay-forward <vps-tailscale-ip>:8443         # custom listen addr
 //   codex-relay-forward 0.0.0.0:8443 http://proxy:8080  # full custom
 //
 // Env vars:
