@@ -260,6 +260,12 @@ async function cmdInstallSelf(opts = {}) {
   try {
     fs.writeFileSync(dest, scriptContent, { mode: 0o755 });
 
+    // Also install codex-relay-forward if available
+    const forwarderSrc = path.join(path.dirname(SCRIPT_PATH), "codex-relay-forward");
+    if (fs.existsSync(forwarderSrc)) {
+      fs.writeFileSync(path.join(binDir, "codex-relay-forward"), fs.readFileSync(forwarderSrc), { mode: 0o755 });
+    }
+
     const inPath = process.env.PATH.split(":").some((p) => path.resolve(p) === path.resolve(binDir));
     let findable = false;
     try {
@@ -464,15 +470,24 @@ function cmdVpsSetup(target) {
   saveConfig(cfg);
   info(`VPS configured: ${target}`);
 
-  // Deploy forwarder
-  info("deploying codex-relay-forward...");
+  // Deploy forwarder — try local file first, fall back to GitHub
   const keyArg = key ? ["-i", key] : [];
-  try {
-    const scriptDir = path.dirname(SCRIPT_PATH);
-    const forwarderPath = path.join(scriptDir, "codex-relay-forward");
-    if (!fs.existsSync(forwarderPath)) die("codex-relay-forward not found in " + scriptDir);
-    execSync(`scp -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${forwarderPath}' '${target}:/usr/local/bin/'`, { encoding: "utf8", timeout: 15000, stdio: "pipe" });
-  } catch (e) { die(`deploy failed: ${e.message}`); }
+  const scriptDir = path.dirname(SCRIPT_PATH);
+  const forwarderPath = path.join(scriptDir, "codex-relay-forward");
+  let deployCmd = "";
+
+  if (fs.existsSync(forwarderPath)) {
+    // Local file available — scp it
+    deployCmd = `scp -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${forwarderPath}' '${target}:/usr/local/bin/'`;
+  } else {
+    // Download from GitHub
+    const url = "https://raw.githubusercontent.com/garry-x/codex-relay/main/codex-relay-forward";
+    deployCmd = `ssh -o StrictHostKeyChecking=no ${keyArg.map(a => `'${a}'`).join(" ")} '${target}' "curl -fsSLo /usr/local/bin/codex-relay-forward '${url}' && chmod +x /usr/local/bin/codex-relay-forward"`;
+  }
+
+  info("deploying codex-relay-forward...");
+  try { execSync(deployCmd, { encoding: "utf8", timeout: 15000, stdio: "pipe" }); }
+  catch (e) { die(`deploy failed: ${e.message}`); }
 
   // Start forwarder
   try {
