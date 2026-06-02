@@ -27,8 +27,7 @@ function loadConfig() {
 
 const LISTEN = process.argv[2] || process.env.FORWARD_LISTEN || "0.0.0.0:8443";
 const PROXY_URL = process.argv[3] || process.env.FORWARD_PROXY ||
-                  loadConfig().https || loadConfig().http ||
-                  loadConfig().split?.edge_proxy;
+                  loadConfig().https || loadConfig().http;
 
 if (!PROXY_URL) {
   console.error("error: no upstream proxy configured. Set FORWARD_PROXY env var,");
