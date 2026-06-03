@@ -190,13 +190,13 @@
   Codex CLI
     |
     | HTTP CONNECT api.openai.com:443
-    | 目标代理: http://<vps-tailscale-ip>:8443
+    | 目标代理: http://&lt;vps-tailscale-ip&gt;:8443
     v
 Tailscale / WireGuard 内网
     |
     v
 VPS
-  codex-relay-forward <vps-tailscale-ip>:8443
+  codex-relay-forward &lt;vps-tailscale-ip&gt;:8443
     |
     | 校验 CONNECT 目标是否在 FORWARD_ALLOW
     | 重新向上游静态代理发起 CONNECT
@@ -248,14 +248,14 @@ OpenAI / Codex 相关服务</pre>
   <h3>关键配置</h3>
   <pre>本机 ~/.codex-relay/config.json
 {
-  "http": "http://<vps-tailscale-ip>:8443",
-  "https": "http://<vps-tailscale-ip>:8443"
+  "http": "http://&lt;vps-tailscale-ip&gt;:8443",
+  "https": "http://&lt;vps-tailscale-ip&gt;:8443"
 }
 
 VPS ~/.codex-relay/config.json
 {
-  "http": "http://<proxy-user>:<proxy-pass>@<static-proxy-host>:8080",
-  "https": "http://<proxy-user>:<proxy-pass>@<static-proxy-host>:8080"
+  "http": "http://&lt;proxy-user&gt;:&lt;proxy-pass&gt;@&lt;static-proxy-host&gt;:8080",
+  "https": "http://&lt;proxy-user&gt;:&lt;proxy-pass&gt;@&lt;static-proxy-host&gt;:8080"
 }</pre>
 
   <table>
@@ -320,7 +320,7 @@ node codex-relay proxy check --timeout 15
 node codex-relay vps status
 
 # 手动 curl 验证
-curl -v --proxy http://<vps-tailscale-ip>:8443 https://api.openai.com -o /dev/null</pre>
+curl -v --proxy http://&lt;vps-tailscale-ip&gt;:8443 https://api.openai.com -o /dev/null</pre>
 
   <footer>
     本文档由当前仓库实现和脱敏后的本机诊断结果生成；后续如果代理地址、VPS 地域、上游静态代理或 Codex 访问域名变化，需要重新采样并更新。
