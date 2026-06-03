@@ -38,7 +38,7 @@ codex-relay chat
 | `proxy set <url>` | 配置代理 URL，保存到 `~/.codex-relay/config.json` |
 | `proxy show` | 显示当前代理配置和生效状态 |
 | `proxy unset` | 清除代理配置 |
-| `proxy check [--url URL] [--timeout S]` | 全链路诊断：代理配置、curl、连通性、npm、codex |
+| `proxy check [--url URL] [--timeout S]` | 全链路诊断：代理配置、curl、连通性、分段耗时、npm、codex |
 | `vps setup <user@host> [--key path]` | 部署 `codex-relay-forward` 到 VPS |
 | `vps proxy set <url>` | 设置 VPS 上游静态代理 |
 | `vps proxy show` | 显示 VPS 上游代理 |
@@ -68,14 +68,14 @@ chmod +x /usr/local/bin/codex-relay-forward
 
 ```bash
 # 方式 A：环境变量
-export FORWARD_PROXY=http://user:pass@static-proxy:8080
+export FORWARD_PROXY=http://<proxy-user>:<proxy-pass>@<static-proxy-host>:8080
 
 # 方式 B：config.json（推荐）
 mkdir -p ~/.codex-relay
 cat > ~/.codex-relay/config.json << 'EOF'
 {
-  "http": "http://user:pass@static-proxy:8080",
-  "https": "http://user:pass@static-proxy:8080"
+  "http": "http://<proxy-user>:<proxy-pass>@<static-proxy-host>:8080",
+  "https": "http://<proxy-user>:<proxy-pass>@<static-proxy-host>:8080"
 }
 EOF
 ```
@@ -83,7 +83,7 @@ EOF
 ### 4. 启动
 
 ```bash
-# 前台测试（显式监听 Tailscale IP 或 0.0.0.0）
+# 前台测试（建议显式监听 Tailscale 地址）
 codex-relay-forward <vps-tailscale-ip>:8443
 
 # 后台运行
@@ -92,7 +92,7 @@ nohup codex-relay-forward <vps-tailscale-ip>:8443 &
 
 输出示例：
 ```
-[codex-relay-forward] <vps-tailscale-ip>:8443 → http://***@static-proxy:8080
+[codex-relay-forward] <vps-tailscale-ip>:8443 → http://***@<static-proxy-host>:8080
 ```
 
 ### 5. systemd 持久化
@@ -106,7 +106,7 @@ After=network.target
 ExecStart=/usr/local/bin/codex-relay-forward <vps-tailscale-ip>:8443
 Restart=always
 RestartSec=5
-Environment=FORWARD_PROXY=http://user:pass@static-proxy:8080
+Environment=FORWARD_PROXY=http://<proxy-user>:<proxy-pass>@<static-proxy-host>:8080
 
 [Install]
 WantedBy=multi-user.target
@@ -155,7 +155,7 @@ systemctl enable --now codex-relay-forward
 ## 故障排查
 
 ```bash
-# 完整诊断
+# 完整诊断（包含 total / tcp-to-proxy / tls-ready / first-byte）
 codex-relay proxy check
 
 # 手动测试转发链路
@@ -202,15 +202,15 @@ codex-relay run doctor
 |---|---|---|
 | `HTTP_PROXY` / `HTTPS_PROXY` | 本机 | 优先于 config.json，指向 VPS Tailscale IP |
 | `FORWARD_PROXY` | VPS | forwarder 使用的上游代理，优先于 config.json |
-| `FORWARD_LISTEN` | VPS | forwarder 监听地址，默认 `127.0.0.1:8443`；VPS 部署时建议显式传 Tailscale IP |
+| `FORWARD_LISTEN` | VPS | forwarder 监听地址，默认 `localhost:8443`；VPS 部署时建议显式传 Tailscale 地址 |
 | `FORWARD_ALLOW` | VPS | 允许 CONNECT 的目标，逗号分隔；默认 `api.openai.com:443,chatgpt.com:443,auth.openai.com:443,cdn.openai.com:443` |
 | `NODE_EXTRA_CA_CERTS` | — | 不再需要（不进行 TLS 终止） |
 
 ## 安全说明
 
 - `~/.codex-relay` 会以 `0700` 创建，`config.json` 会以 `0600` 写入，避免代理账号密码被其他本机用户读取。
-- 日志和 `proxy show` 会脱敏 `user:pass@proxy` 中的认证信息。
-- `codex-relay-forward` 默认只监听 `127.0.0.1:8443`。在 VPS 上运行时请显式监听 Tailscale IP，例如 `codex-relay-forward <vps-tailscale-ip>:8443`。
+- 日志和 `proxy show` 会脱敏代理 URL 中的认证信息。
+- `codex-relay-forward` 默认只监听本机 localhost。在 VPS 上运行时请显式监听 Tailscale 地址，例如 `codex-relay-forward <vps-tailscale-ip>:8443`。
 - `codex-relay-forward` 默认只允许连接常见 OpenAI/Codex 相关域名。如需扩展：
 
 ```bash

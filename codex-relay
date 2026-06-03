@@ -122,6 +122,38 @@ function waitForClose(proc) {
   });
 }
 
+function curlMs(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  return Math.round(seconds * 1000);
+}
+
+function parseCurlTimings(out) {
+  const values = {};
+  for (const line of String(out).trim().split(/\r?\n/)) {
+    const idx = line.indexOf("=");
+    if (idx <= 0) continue;
+    values[line.slice(0, idx)] = line.slice(idx + 1);
+  }
+  return {
+    code: parseInt(values.http_code || "", 10),
+    connectMs: curlMs(values.time_connect),
+    appconnectMs: curlMs(values.time_appconnect),
+    starttransferMs: curlMs(values.time_starttransfer),
+    totalMs: curlMs(values.time_total),
+  };
+}
+
+function formatCurlTimings(timing, fallbackMs) {
+  const parts = [];
+  const total = timing.totalMs ?? fallbackMs;
+  if (total != null) parts.push(`${total}ms total`);
+  if (timing.connectMs != null) parts.push(`${timing.connectMs}ms tcp-to-proxy`);
+  if (timing.appconnectMs != null) parts.push(`${timing.appconnectMs}ms tls-ready`);
+  if (timing.starttransferMs != null) parts.push(`${timing.starttransferMs}ms first-byte`);
+  return parts.join(", ");
+}
+
 // Detect the shell config file for PATH setup.
 function detectShellRc() {
   let shell = process.env.SHELL || "";
@@ -219,15 +251,22 @@ function cmdProxyCheck(opts = {}) {
       const out = runChecked("curl", [
         "-s",
         "-o", "/dev/null",
-        "-w", "%{http_code}",
+        "-w", [
+          "http_code=%{http_code}",
+          "time_connect=%{time_connect}",
+          "time_appconnect=%{time_appconnect}",
+          "time_starttransfer=%{time_starttransfer}",
+          "time_total=%{time_total}",
+        ].join("\\n"),
         "--proxy", proxyUrl,
         "--connect-timeout", String(timeout),
         "--max-time", String(timeout),
         testUrl,
       ], { timeout: (timeout + 5) * 1000 }).trim();
       const latency = Date.now() - start;
-      const code = parseInt(out, 10);
-      check("proxy connectivity", code >= 200 && code < 500, `HTTP ${out}, ${latency}ms → ${testUrl}`);
+      const timing = parseCurlTimings(out);
+      const timingDetail = formatCurlTimings(timing, latency);
+      check("proxy connectivity", timing.code >= 200 && timing.code < 500, `HTTP ${timing.code || "000"}, ${timingDetail} → ${testUrl}`);
     } catch {
       check("proxy connectivity", false, `connection failed → ${testUrl}`);
     }

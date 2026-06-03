@@ -309,6 +309,17 @@ VPS ~/.codex-relay/config.json
     <tr><td>波动范围</td><td>约 0.93-1.84 秒</td><td>链路存在秒级抖动，主要受 Tailscale 路径、VPS 网络和上游代理影响。</td></tr>
   </table>
 
+  <h3>分段耗时</h3>
+  <p><code>proxy check</code> 会输出 curl 的分段计时，帮助判断延时是否主要来自首次建连和 TLS 握手。这些时间是单次新连接的累计耗时，不代表 Codex 流式响应中每个 token 的延时。</p>
+  <pre>✓ proxy connectivity (HTTP 421, 1636ms total, 225ms tcp-to-proxy, 1403ms tls-ready, 1636ms first-byte → https://api.openai.com)</pre>
+  <table>
+    <tr><th>字段</th><th>含义</th></tr>
+    <tr><td><code>total</code></td><td>本次 curl 诊断总耗时。</td></tr>
+    <tr><td><code>tcp-to-proxy</code></td><td>本机到配置代理地址的 TCP 建连时间，主要反映本机到 VPS/Tailscale 这一段。</td></tr>
+    <tr><td><code>tls-ready</code></td><td>TLS 握手完成的累计时间；在当前链路下包含代理 CONNECT、多跳建连和到 OpenAI 的首次 TLS 握手。</td></tr>
+    <tr><td><code>first-byte</code></td><td>收到 OpenAI 响应首字节的累计时间。</td></tr>
+  </table>
+
   <p class="muted">本次完整诊断为 OK：代理配置存在，curl 可用，OpenAI 目标经代理可达，npm 可用，Codex CLI 可用，VPS forwarder 正在运行。具体主机地址、监听地址和版本细节不写入公开文档。</p>
 
   <h2>七、常用诊断命令</h2>
