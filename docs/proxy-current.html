@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>codex-relay 当前 Proxy 方案说明</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2128;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --blue: #58a6ff;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --purple: #a371f7;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.65;
+  }
+  main {
+    max-width: 1040px;
+    margin: 0 auto;
+    padding: 48px 24px 80px;
+  }
+  header {
+    padding: 40px 0 32px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 36px;
+  }
+  h1 {
+    margin: 0 0 10px;
+    font-size: 2.3rem;
+    line-height: 1.15;
+    letter-spacing: 0;
+  }
+  h2 {
+    margin: 44px 0 16px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    font-size: 1.45rem;
+  }
+  h3 {
+    margin: 28px 0 10px;
+    color: var(--blue);
+    font-size: 1.1rem;
+  }
+  p { margin: 10px 0; }
+  a { color: var(--blue); }
+  code {
+    color: var(--blue);
+    font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
+    font-size: 0.92em;
+  }
+  pre {
+    overflow-x: auto;
+    margin: 14px 0;
+    padding: 18px 20px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
+    font-size: 0.9rem;
+    line-height: 1.65;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  th, td {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+    text-align: left;
+  }
+  tr:last-child td { border-bottom: 0; }
+  th {
+    color: var(--muted);
+    font-size: 0.82rem;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+  .lead {
+    max-width: 760px;
+    color: var(--muted);
+    font-size: 1.04rem;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 16px;
+    margin: 18px 0;
+  }
+  .card {
+    padding: 18px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .card strong {
+    display: block;
+    margin-bottom: 6px;
+    color: #fff;
+  }
+  .muted { color: var(--muted); }
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
+    padding: 2px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 0.82rem;
+    line-height: 1.3;
+  }
+  .ok { color: var(--green); }
+  .warn { color: var(--yellow); }
+  .bad { color: var(--red); }
+  .diagram {
+    padding: 20px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .diagram pre {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+  }
+  .metric {
+    font-size: 1.65rem;
+    font-weight: 700;
+    color: #fff;
+  }
+  .metric small {
+    display: block;
+    margin-top: 4px;
+    color: var(--muted);
+    font-size: 0.86rem;
+    font-weight: 400;
+  }
+  ul { padding-left: 22px; }
+  li { margin: 7px 0; }
+  footer {
+    margin-top: 56px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  @media (max-width: 780px) {
+    main { padding: 30px 16px 56px; }
+    h1 { font-size: 1.8rem; }
+    .grid { grid-template-columns: 1fr; }
+    table { display: block; overflow-x: auto; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="tag">codex-relay 0.4.0 / 当前 proxy 方案</div>
+    <h1>VPS Forwarder + Tailscale + Static Proxy</h1>
+    <p class="lead">当前方案把本机 Codex CLI 的代理请求送到 Tailscale 内网里的 VPS，再由 VPS 上的轻量 CONNECT forwarder 通过上游静态代理访问 OpenAI。全程不做 TLS 终止，VPS 只转发隧道字节流。</p>
+  </header>
+
+  <h2>一、链路总览</h2>
+  <div class="diagram">
+    <pre>本机
+  codex-relay run
+    |
+    | 注入 HTTP_PROXY / HTTPS_PROXY
+    v
+  Codex CLI
+    |
+    | HTTP CONNECT api.openai.com:443
+    | 目标代理: http://100.114.41.104:8443
+    v
+Tailscale / WireGuard 内网
+    |
+    v
+VPS
+  codex-relay-forward 0.0.0.0:8443
+    |
+    | 校验 CONNECT 目标是否在 FORWARD_ALLOW
+    | 重新向上游静态代理发起 CONNECT
+    v
+上游 Static Proxy
+    |
+    | TLS 隧道继续透传
+    v
+OpenAI / Codex 相关服务</pre>
+  </div>
+
+  <h3>请求时序</h3>
+  <ol>
+    <li>用户执行 <code>codex-relay run ...</code> 或直接通过 <code>codex-relay &lt;args&gt;</code> 透传。</li>
+    <li><code>codex-relay</code> 从环境变量或 <code>~/.codex-relay/config.json</code> 解析代理地址，并注入 <code>HTTP_PROXY</code>、<code>HTTPS_PROXY</code>、<code>WS_PROXY</code>、<code>WSS_PROXY</code>。</li>
+    <li>Codex CLI 对 <code>api.openai.com:443</code> 等目标发起 HTTP CONNECT，请求先进入 VPS 的 Tailscale IP <code>100.114.41.104:8443</code>。</li>
+    <li><code>codex-relay-forward</code> 解析 CONNECT 目标，确认命中允许列表后，连接上游静态 HTTP 代理。</li>
+    <li>VPS forwarder 向上游代理发送新的 CONNECT 请求。上游返回 <code>200 Connection Established</code> 后，本机和 OpenAI 之间的 TLS 数据开始双向 pipe。</li>
+    <li>VPS forwarder 不读取业务 payload，不解密 HTTPS，不修改 OpenAI 请求体和响应体。</li>
+  </ol>
+
+  <h2>二、组件职责</h2>
+  <div class="grid">
+    <section class="card">
+      <strong>codex-relay</strong>
+      <p class="muted">本机 CLI 包装器。负责保存代理配置、检查连通性、安装 Codex CLI、启动 Codex 时注入代理环境变量。</p>
+    </section>
+    <section class="card">
+      <strong>codex-relay-forward</strong>
+      <p class="muted">VPS 上的 TCP CONNECT 转发器。只支持 HTTP 上游代理，默认监听 <code>127.0.0.1:8443</code>，部署时通常显式监听 Tailscale IP 或 <code>0.0.0.0:8443</code>。</p>
+    </section>
+    <section class="card">
+      <strong>Tailscale</strong>
+      <p class="muted">本机到 VPS 的 WireGuard 加密网络。避免把 forwarder 暴露到公网，也不需要 SSH 隧道常驻。</p>
+    </section>
+  </div>
+
+  <h2>三、需要的依赖</h2>
+  <table>
+    <tr><th>位置</th><th>依赖</th><th>要求</th><th>用途</th></tr>
+    <tr><td>本机</td><td>Node.js</td><td><code>&gt;= 18</code></td><td>运行 <code>codex-relay</code>，使用 Node 内置模块，无 npm 运行时依赖。</td></tr>
+    <tr><td>本机</td><td>npm</td><td>可用即可</td><td>安装或更新 <code>@openai/codex</code>。</td></tr>
+    <tr><td>本机</td><td>curl</td><td>可用即可</td><td><code>proxy check</code> 使用 curl 走代理检查 OpenAI 连通性和延时。</td></tr>
+    <tr><td>本机 / VPS</td><td>Tailscale</td><td>同一 tailnet</td><td>建立本机到 VPS 的加密内网链路。</td></tr>
+    <tr><td>VPS</td><td>Node.js</td><td><code>&gt;= 18</code></td><td>运行 <code>codex-relay-forward</code>。</td></tr>
+    <tr><td>VPS</td><td>上游静态代理</td><td>HTTP proxy</td><td>forwarder 当前只支持 <code>http://...</code> 形式的上游代理，并通过它访问 OpenAI。</td></tr>
+  </table>
+
+  <h3>关键配置</h3>
+  <pre>本机 ~/.codex-relay/config.json
+{
+  "http": "http://100.114.41.104:8443",
+  "https": "http://100.114.41.104:8443"
+}
+
+VPS ~/.codex-relay/config.json
+{
+  "http": "http://user:pass@static-proxy:8080",
+  "https": "http://user:pass@static-proxy:8080"
+}</pre>
+
+  <table>
+    <tr><th>环境变量</th><th>作用</th></tr>
+    <tr><td><code>HTTP_PROXY</code> / <code>HTTPS_PROXY</code></td><td>本机优先级最高的代理来源。存在时会覆盖配置文件。</td></tr>
+    <tr><td><code>FORWARD_PROXY</code></td><td>VPS forwarder 的上游静态代理地址，优先于 VPS 配置文件。</td></tr>
+    <tr><td><code>FORWARD_LISTEN</code></td><td>VPS forwarder 监听地址，默认 <code>127.0.0.1:8443</code>。</td></tr>
+    <tr><td><code>FORWARD_ALLOW</code></td><td>允许 CONNECT 的目标列表，默认包含 <code>api.openai.com:443</code>、<code>chatgpt.com:443</code>、<code>auth.openai.com:443</code>、<code>cdn.openai.com:443</code>。</td></tr>
+  </table>
+
+  <h2>四、优势</h2>
+  <ul>
+    <li><span class="ok">不需要本地 CA 和 TLS 终止。</span> HTTPS 仍是 Codex CLI 到 OpenAI 的端到端 TLS，VPS 不解密业务流量。</li>
+    <li><span class="ok">运行面很小。</span> 两个脚本都只依赖 Node.js 内置模块，没有服务端 npm 包和额外守护框架。</li>
+    <li><span class="ok">部署路径清晰。</span> 本机只知道 VPS Tailscale IP，VPS 只知道上游静态代理，职责分层明确。</li>
+    <li><span class="ok">比 SSH 隧道更稳定。</span> 依赖 Tailscale 常驻网络，不需要为每次使用维护 SSH tunnel。</li>
+    <li><span class="ok">有基础目标白名单。</span> forwarder 默认只允许 OpenAI / Codex 相关域名，降低被误用为通用代理的风险。</li>
+    <li><span class="ok">诊断直接。</span> <code>codex-relay proxy check</code> 同时检查代理配置、curl、代理连通性、npm、Codex CLI 和 VPS forwarder 状态。</li>
+  </ul>
+
+  <h2>五、当前问题和风险</h2>
+  <ul>
+    <li><span class="warn">链路比直连多两跳。</span> 请求路径包含 Tailscale VPS 和上游静态代理，延时受 VPS 地域、Tailscale DERP/直连状态、上游代理质量共同影响。</li>
+    <li><span class="warn">上游只支持 HTTP proxy。</span> <code>codex-relay-forward</code> 的 <code>parseProxy</code> 明确拒绝非 <code>http:</code> 上游，暂不支持 SOCKS、HTTPS proxy。</li>
+    <li><span class="warn">VPS 监听面需要控制。</span> 当前状态显示 forwarder 监听 <code>0.0.0.0:8443</code>。如果 VPS 公网安全组也放开该端口，建议改为只监听 Tailscale IP，或用防火墙只允许 tailnet 来源。</li>
+    <li><span class="warn">allowlist 需要随 Codex 访问域名更新。</span> 新增 OpenAI/Codex 域名时，可能需要调整 <code>FORWARD_ALLOW</code>，否则 forwarder 会返回 <code>403 Forbidden</code>。</li>
+    <li><span class="warn">空闲超时为 30 秒。</span> forwarder 对客户端和上游连接设置 <code>30000ms</code> idle timeout。长时间无流量的连接可能被断开。</li>
+    <li><span class="bad">现有 HTML 指南存在旧模式描述。</span> <code>docs/guide.html</code> 中还有 chain relay/token 方案内容，但当前 <code>codex-relay</code> 代码没有对应命令；以本文档和 <code>README.md</code> 的 VPS forwarder 方案为准。</li>
+  </ul>
+
+  <h2>六、当前延时情况</h2>
+  <p>采样时间：2026-06-03，环境时区 Asia/Shanghai。测试命令为 <code>node codex-relay proxy check --timeout 15</code>，目标为 <code>https://api.openai.com</code>，代理为 <code>http://100.114.41.104:8443</code>。</p>
+  <div class="grid">
+    <section class="card">
+      <div class="metric">1531 ms<small>5 次平均值</small></div>
+    </section>
+    <section class="card">
+      <div class="metric">1220 ms<small>中位数</small></div>
+    </section>
+    <section class="card">
+      <div class="metric">932-2573 ms<small>本次采样范围</small></div>
+    </section>
+  </div>
+
+  <table>
+    <tr><th>采样</th><th>结果</th><th>延时</th><th>说明</th></tr>
+    <tr><td>1</td><td><code>HTTP 421</code></td><td>1772 ms</td><td>代理链路可达，OpenAI 根路径返回 4xx 属于连通性可验证状态。</td></tr>
+    <tr><td>2</td><td><code>HTTP 421</code></td><td>1160 ms</td><td>可达。</td></tr>
+    <tr><td>3</td><td><code>HTTP 421</code></td><td>932 ms</td><td>本次最短。</td></tr>
+    <tr><td>4</td><td><code>HTTP 421</code></td><td>1220 ms</td><td>接近中位数。</td></tr>
+    <tr><td>5</td><td><code>HTTP 421</code></td><td>2573 ms</td><td>本次最长，说明链路存在秒级抖动。</td></tr>
+  </table>
+
+  <p class="muted">本次完整诊断为 6 OK、0 issues：代理配置存在，curl 可用，OpenAI 目标经代理可达，npm 可用，Codex CLI 版本为 <code>codex-cli 0.136.0</code>，VPS forwarder 正在监听 <code>0.0.0.0:8443</code>。</p>
+
+  <h2>七、常用诊断命令</h2>
+  <pre># 查看当前生效代理
+node codex-relay proxy show
+
+# 全链路诊断和延时
+node codex-relay proxy check --timeout 15
+
+# 只看 VPS forwarder 状态
+node codex-relay vps status
+
+# 手动 curl 验证
+curl -v --proxy http://100.114.41.104:8443 https://api.openai.com -o /dev/null</pre>
+
+  <footer>
+    本文档由当前仓库实现和 2026-06-03 的本机诊断结果生成；后续如果代理地址、VPS 地域、上游静态代理或 Codex 访问域名变化，需要重新采样并更新。
+  </footer>
+</main>
+</body>
+</html>
