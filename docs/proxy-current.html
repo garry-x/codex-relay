@@ -287,24 +287,26 @@ VPS ~/.codex-relay/config.json
   </ul>
 
   <h2>六、当前延时情况</h2>
-  <p>延时通过 <code>node codex-relay proxy check --timeout 15</code> 采样，目标为 <code>https://api.openai.com</code>，代理地址使用本机配置中的 VPS Tailscale 地址。文档不记录具体 IP、账号、VPS 地域或上游代理信息。</p>
+  <p>延时通过 <code>node codex-relay proxy check --timeout 15</code> 采样，目标为 <code>https://api.openai.com</code>，代理地址使用本机配置中的 VPS Tailscale 地址。采样口径为连续测试 10 次、每次间隔 1 秒、丢弃前 5 次结果，仅统计后 5 次。文档不记录具体 IP、账号、VPS 地域或上游代理信息。</p>
   <div class="grid">
     <section class="card">
-      <div class="metric">约 1.5 s<small>本次 5 次采样平均值</small></div>
+      <div class="metric">约 1.23 s<small>后 5 次平均值</small></div>
     </section>
     <section class="card">
-      <div class="metric">约 1.2 s<small>本次 5 次采样中位数</small></div>
+      <div class="metric">约 0.94 s<small>后 5 次中位数</small></div>
     </section>
     <section class="card">
-      <div class="metric">约 1-3 s<small>本次采样范围</small></div>
+      <div class="metric">约 0.93-1.84 s<small>后 5 次范围</small></div>
     </section>
   </div>
 
   <table>
     <tr><th>项目</th><th>结果</th><th>说明</th></tr>
     <tr><td>连通性</td><td><code>HTTP 421</code></td><td>代理链路可达，OpenAI 根路径返回 4xx 属于连通性可验证状态。</td></tr>
-    <tr><td>平均延时</td><td>约 1.5 秒</td><td>基于 5 次连续诊断采样。</td></tr>
-    <tr><td>波动范围</td><td>约 1-3 秒</td><td>链路存在秒级抖动，主要受 Tailscale 路径、VPS 网络和上游代理影响。</td></tr>
+    <tr><td>采样口径</td><td>10 次，间隔 1 秒</td><td>丢弃前 5 次预热结果，仅统计后 5 次。</td></tr>
+    <tr><td>平均延时</td><td>约 1.23 秒</td><td>基于后 5 次诊断采样。</td></tr>
+    <tr><td>中位数</td><td>约 0.94 秒</td><td>后 5 次样本排序后的中间值。</td></tr>
+    <tr><td>波动范围</td><td>约 0.93-1.84 秒</td><td>链路存在秒级抖动，主要受 Tailscale 路径、VPS 网络和上游代理影响。</td></tr>
   </table>
 
   <p class="muted">本次完整诊断为 OK：代理配置存在，curl 可用，OpenAI 目标经代理可达，npm 可用，Codex CLI 可用，VPS forwarder 正在运行。具体主机地址、监听地址和版本细节不写入公开文档。</p>
