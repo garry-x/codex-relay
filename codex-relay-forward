@@ -156,6 +156,9 @@ const server = net.createServer((client) => {
       client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       const leftover = resp.slice(eoh + 4);
       if (leftover.length) upstream.unshift(leftover);
+      // Tunnel established — disable idle timeouts for long-lived streaming
+      client.setTimeout(0);
+      upstream.setTimeout(0);
       client.pipe(upstream);
       upstream.pipe(client);
     });
